@@ -5,10 +5,19 @@
 #define REFTIMES_PER_MILLISEC  10000
 
 // Buffers
-#define AUDIO_BUFFER_SIZE 10000000
-unsigned int AudioWritePos = 0;
+//
+// CmdAudio takes its byte count in a uint16, so one drain must stay well under
+// 65535: a larger backlog truncates, and an exact multiple of 65536 puts an
+// empty CMD_AUDIO on the wire that the core rejects with UDP_ERROR. That is not
+// hypothetical - the WASAPI loopback buffer below is a full second deep, so any
+// stall (notably the gap between the stream starting and the first video frame)
+// builds one. 16 KB is ~85 ms at 48 kHz stereo; steady state is ~3.2 KB/frame.
+#define AUDIO_MAX_BYTES   16384
+#define AUDIO_MAX_SAMPLES (AUDIO_MAX_BYTES / 2)  // int16 samples, 4096 stereo frames
+
+unsigned int AudioWritePos = 0;                  // in int16 samples, always even
 std::atomic_int audioSampleRate;
-uint16_t* audioBuffer = nullptr;
+int16_t* audioBuffer = nullptr;                  // points at the client's registered audio buffer
 
 // Audio Capture
 REFERENCE_TIME hnsRequestedDuration = REFTIMES_PER_SEC;
@@ -19,6 +28,7 @@ IMMDevice *pDevice = NULL;
 IAudioClient *pAudioClient = NULL;
 IAudioCaptureClient *pCaptureClient = NULL;
 WAVEFORMATEX *pwfx = NULL;
+bool audioFormatUsable = false;
 
 bool InitAudioCapture()
 {
@@ -44,6 +54,21 @@ bool InitAudioCapture()
     hr = pAudioClient->GetMixFormat(&pwfx);
     audioSampleRate = pwfx->nSamplesPerSec;
     EXIT_ON_ERROR(hr, "IAudioClient GetMixFormat failed");
+
+    // The shared-mode mix format is 32-bit float in every shipping configuration
+    // of WASAPI, and the capture path below reads it as such. Refuse rather than
+    // reinterpret if that ever stops being true.
+    audioFormatUsable = (pwfx->wBitsPerSample == 32 && pwfx->nChannels >= 1);
+    if (!audioFormatUsable)
+    {
+        LogMessage("Windows is mixing at " + std::to_string(pwfx->wBitsPerSample) +
+            " bits per sample, which MiSTerCast cannot convert. Audio is disabled.", true);
+    }
+    else if (pwfx->nChannels > 2)
+    {
+        LogMessage("Windows is mixing " + std::to_string(pwfx->nChannels) +
+            " channels; front left/right will be streamed.");
+    }
 
     hr = pAudioClient->Initialize(
         AUDCLNT_SHAREMODE_SHARED,
@@ -89,12 +114,27 @@ bool StopAudioCapture()
      return true;
 }
 
+// Float sample to signed 16-bit LE. The clamp matters: mixers with DC filters
+// and volume scaling overshoot +-1.0, and an unclamped sample wraps into an
+// audible click rather than clipping.
+inline int16_t AudioSampleToS16(float sample)
+{
+    if (sample > 1.0f)
+        sample = 1.0f;
+    else if (sample < -1.0f)
+        sample = -1.0f;
+
+    return (int16_t)(sample * 32767.0f);
+}
+
 bool TickAudioCapture()
 {
     AudioWritePos = 0;
     UINT32 packetLength = 0;
     HRESULT hr = pCaptureClient->GetNextPacketSize(&packetLength);
     EXIT_ON_ERROR(hr, "IAudioCaptureClient GetNextPacketSize failed");
+
+    const unsigned int channels = pwfx ? pwfx->nChannels : 2;
 
     while (packetLength != 0)
     {
@@ -107,31 +147,54 @@ bool TickAudioCapture()
             &flags, NULL, NULL);
         EXIT_ON_ERROR(hr, "IAudioCaptureClient GetBuffer failed");
 
-        if (!audioBuffer)
-            return true;
-
-        bool silence = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
-
-        float* pDataFloat = (float*)pData;
-        unsigned int lFloatsToWrite = numFramesAvailable * pwfx->nBlockAlign / sizeof(float);
-        unsigned int dataPos = 0;
-        while (dataPos < lFloatsToWrite)
+        // Keep draining even when there is nowhere to put it, otherwise the
+        // endpoint buffer backs up and every later packet is discontinuous.
+        if (audioBuffer && audioFormatUsable)
         {
-            LONG writeLength = std::min(AUDIO_BUFFER_SIZE - AudioWritePos, lFloatsToWrite - dataPos);
-            if (silence)
+            const bool silence = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
+            const float* pDataFloat = (const float*)pData;
+            const unsigned int capFrames = AUDIO_MAX_SAMPLES / 2;
+
+            // Shed the oldest audio so latency self-corrects after a stall
+            // instead of accumulating. Done in whole stereo frames, and at most
+            // one move per packet - trimming a frame at a time would be
+            // quadratic on the backlog this exists to handle.
+            UINT32 firstFrame = 0;
+            if (numFramesAvailable > capFrames)
             {
-                ZeroMemory(&audioBuffer[AudioWritePos], writeLength * sizeof(audioBuffer[0]));
-            }
-            else
-            {
-                for (int i = 0; i < writeLength; i++)
-                {
-                    audioBuffer[AudioWritePos + i] = (uint16_t)(pDataFloat[dataPos + i] * 32767);
-                }
+                // This packet alone overflows; everything older is superseded.
+                firstFrame = numFramesAvailable - capFrames;
+                AudioWritePos = 0;
             }
 
-            dataPos += writeLength;
-            AudioWritePos = (AudioWritePos + writeLength) % AUDIO_BUFFER_SIZE;
+            const UINT32 framesToWrite = numFramesAvailable - firstFrame;
+            const unsigned int heldFrames = AudioWritePos / 2;
+            if (heldFrames + framesToWrite > capFrames)
+            {
+                const unsigned int dropFrames = heldFrames + framesToWrite - capFrames;
+                const unsigned int keepSamples = AudioWritePos - dropFrames * 2;
+                memmove(audioBuffer, audioBuffer + dropFrames * 2, keepSamples * sizeof(int16_t));
+                AudioWritePos = keepSamples;
+            }
+
+            for (UINT32 frame = firstFrame; frame < numFramesAvailable; frame++)
+            {
+                if (silence)
+                {
+                    audioBuffer[AudioWritePos] = 0;
+                    audioBuffer[AudioWritePos + 1] = 0;
+                }
+                else
+                {
+                    const float* srcFrame = pDataFloat + (size_t)frame * channels;
+                    const int16_t left = AudioSampleToS16(srcFrame[0]);
+                    const int16_t right = (channels >= 2) ? AudioSampleToS16(srcFrame[1]) : left;
+                    audioBuffer[AudioWritePos] = left;
+                    audioBuffer[AudioWritePos + 1] = right;
+                }
+
+                AudioWritePos += 2;
+            }
         }
 
         hr = pCaptureClient->ReleaseBuffer(numFramesAvailable);

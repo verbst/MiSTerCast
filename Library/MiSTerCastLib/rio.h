@@ -3,9 +3,16 @@
 using std::cout;
 using std::endl;
 
-//mingw missing headers
-//#if defined(_WIN32) && !defined(WSA_FLAG_REGISTERED_IO)
-#if defined(_WIN32)
+// Registered-IO surface for toolchains whose headers lack it (mingw-w64).
+// Keyed on RIO_INVALID_CQ: it ships in the SAME SDK block (mswsockdef.h,
+// NTDDI >= WIN8) as the RIO types themselves, so it is present exactly when
+// this block must be skipped (MSVC: defining it here collides with the SDK's
+// non-identical types, C2371/C2011) and absent exactly when it must be active
+// (mingw-w64 defines NO RIO types anywhere). Do NOT key on
+// WSA_FLAG_REGISTERED_IO — BOTH toolchains define that flag (mingw
+// winsock2.h:526), it says nothing about the types; that key skipped the
+// block on mingw and broke the build, which is why it was once commented out.
+#if defined(_WIN32) && !defined(RIO_INVALID_CQ)
 #define WSA_FLAG_REGISTERED_IO 0x100
 #define SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER _WSAIORW(IOC_WS2, 36)
 #define WSAID_MULTIPLE_RIO {0x8509e081, 0x96dd, 0x4005, { 0xb1, 0x65, 0x9e, 0x2e, 0xe8, 0xc7, 0x9e, 0x3f } }
@@ -16,10 +23,10 @@ using std::endl;
    * typedef struct RIO_RQ_t *RIO_RQ, **PRIO_RQ;
    * But since RIO_BUFFERID_t, RIO_CQ_t and RIO_RQ_t are not defined I replaced these with void.
    */
-/*typedef void *RIO_BUFFERID, **PRIO_BUFFERID;
+typedef void *RIO_BUFFERID, **PRIO_BUFFERID;
 typedef void *RIO_CQ, **PRIO_CQ;
 typedef void *RIO_RQ, **PRIO_RQ;
-*/
+
 #define RIO_MSG_DONT_NOTIFY           0x00000001
 #define RIO_MSG_DEFER                 0x00000002
 #define RIO_MSG_WAITALL               0x00000004
@@ -32,18 +39,18 @@ typedef void *RIO_RQ, **PRIO_RQ;
 #define RIO_MAX_CQ_SIZE               0x8000000
 #define RIO_CORRUPT_CQ                0xFFFFFFFF
 
-/*typedef struct _RIORESULT {
+typedef struct _RIORESULT {
   LONG Status;
   ULONG BytesTransferred;
   ULONGLONG SocketContext;
   ULONGLONG RequestContext;
-} RIORESULT, *PRIORESULT;*/
+} RIORESULT, *PRIORESULT;
 
-/*typedef struct _RIO_BUF {
+typedef struct _RIO_BUF {
   RIO_BUFFERID BufferId;
   ULONG Offset;
   ULONG Length;
-} RIO_BUF, *PRIO_BUF;*/
+} RIO_BUF, *PRIO_BUF;
 
 typedef BOOL(PASCAL FAR *LPFN_RIORECEIVE)(
     _In_ RIO_RQ SocketQueue, _In_reads_(DataBufferCount) PRIO_BUF pData,
@@ -67,13 +74,13 @@ typedef BOOL(PASCAL FAR *LPFN_RIOSENDEX)(
 
 typedef VOID(PASCAL FAR *LPFN_RIOCLOSECOMPLETIONQUEUE)(_In_ RIO_CQ CQ);
 
-/*typedef enum _RIO_NOTIFICATION_COMPLETION_TYPE {
+typedef enum _RIO_NOTIFICATION_COMPLETION_TYPE {
   RIO_EVENT_COMPLETION = 1,
   RIO_IOCP_COMPLETION = 2,
 } RIO_NOTIFICATION_COMPLETION_TYPE,
-    *PRIO_NOTIFICATION_COMPLETION_TYPE;*/
+    *PRIO_NOTIFICATION_COMPLETION_TYPE;
 
-/*typedef struct _RIO_NOTIFICATION_COMPLETION {
+typedef struct _RIO_NOTIFICATION_COMPLETION {
   RIO_NOTIFICATION_COMPLETION_TYPE Type;
   union {
     struct {
@@ -86,7 +93,7 @@ typedef VOID(PASCAL FAR *LPFN_RIOCLOSECOMPLETIONQUEUE)(_In_ RIO_CQ CQ);
       PVOID Overlapped;
     } Iocp;
   };
-} RIO_NOTIFICATION_COMPLETION, *PRIO_NOTIFICATION_COMPLETION;*/
+} RIO_NOTIFICATION_COMPLETION, *PRIO_NOTIFICATION_COMPLETION;
 
 typedef RIO_CQ(PASCAL FAR *LPFN_RIOCREATECOMPLETIONQUEUE)(
     _In_ DWORD QueueSize,
@@ -116,7 +123,7 @@ typedef BOOL(PASCAL FAR *LPFN_RIORESIZEREQUESTQUEUE)(
     _In_ RIO_RQ RQ, _In_ DWORD MaxOutstandingReceive,
     _In_ DWORD MaxOutstandingSend);
 
-/*typedef struct _RIO_EXTENSION_FUNCTION_TABLE {
+typedef struct _RIO_EXTENSION_FUNCTION_TABLE {
   DWORD cbSize;
   LPFN_RIORECEIVE RIOReceive;
   LPFN_RIORECEIVEEX RIOReceiveEx;
@@ -131,7 +138,7 @@ typedef BOOL(PASCAL FAR *LPFN_RIORESIZEREQUESTQUEUE)(
   LPFN_RIOREGISTERBUFFER RIORegisterBuffer;
   LPFN_RIORESIZECOMPLETIONQUEUE RIOResizeCompletionQueue;
   LPFN_RIORESIZEREQUESTQUEUE RIOResizeRequestQueue;
-} RIO_EXTENSION_FUNCTION_TABLE, *PRIO_EXTENSION_FUNCTION_TABLE;*/
+} RIO_EXTENSION_FUNCTION_TABLE, *PRIO_EXTENSION_FUNCTION_TABLE;
 
 #endif
 

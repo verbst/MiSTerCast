@@ -1,0 +1,32 @@
+# Normalise everything to LF in the repository. Without this the tree shows as
+# wholly modified when checked out on Windows (CRLF working tree vs LF index).
+* text=auto
+
+# Files Visual Studio is happiest editing with CRLF in the working tree.
+*.sln              text eol=crlf
+*.csproj           text eol=crlf
+*.vcxproj          text eol=crlf
+*.vcxproj.filters  text eol=crlf
+*.props            text eol=crlf
+*.xaml             text eol=crlf
+*.cs               text eol=crlf
+*.config           text eol=crlf
+*.resx             text eol=crlf
+*.settings         text eol=crlf
+
+# Vendored wholesale from Groovy_MiSTer api/ (see
+# Library/MiSTerCastLib/PROVENANCE.md). Held byte-identical to upstream so a
+# re-sync stays a straight file copy and `diff` against upstream stays empty.
+Library/MiSTerCastLib/groovymister.h    -text
+Library/MiSTerCastLib/groovymister.cpp  -text
+Library/MiSTerCastLib/nlc_codec.h       -text
+Library/MiSTerCastLib/nlc_codec.cpp     -text
+Library/MiSTerCastLib/rio.h             -text
+Library/MiSTerCastLib/lz4/**            -text
+
+*.ico binary
+*.png binary
+*.jpg binary
+*.dll binary
+*.lib binary
+*.a   binary
