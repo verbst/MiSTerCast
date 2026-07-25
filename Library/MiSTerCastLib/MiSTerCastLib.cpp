@@ -20,6 +20,21 @@ std::string targetIpString;
 #include "groovymister.h"
 #include "renderer_nogpu.h"
 
+// The GroovyMister client logs to stdout, which a WPF process does not have -
+// without this every CmdInit failure reason is invisible to the user.
+static void GroovyLogSink(const char* message)
+{
+    if (message == nullptr)
+        return;
+
+    std::string text(message);
+    while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
+        text.pop_back();
+
+    if (!text.empty())
+        LogMessage(text);
+}
+
 std::atomic_bool capturing_screen = false;
 void capture_screen()
 {
@@ -79,10 +94,22 @@ MISTERCASTLIB_API bool Initialize(log_function fnLog, capture_image_function fnC
     }
 
     logFunction = fnLog;
+    gm_set_log_sink(GroovyLogSink);
     LogMessage("Initializing MiSTerCast");
 
     source_config.syncrefresh = true;
     source_config.framedelay = 0;
+
+    // Overwritten by the first SetStreamOptions; these are what a save file
+    // predating those settings falls back to.
+    stream_config.codec = CodecNLC;
+    stream_config.nlcPack = NlcPackRice;
+    stream_config.nearLevel = 1;
+    stream_config.rgbMode = Rgb888;
+    stream_config.mtu = 1500;
+    stream_config.autoReconnect = true;
+    stream_config.verbose = 0;
+    stream_config.allowOversizeModes = false;
 
     selected_modeline.pclock = 6.700;
     selected_modeline.hactive = 320;
@@ -152,6 +179,57 @@ MISTERCASTLIB_API bool StopStream()
     return true;
 }
 
+MISTERCASTLIB_API bool SetStreamOptions(
+    UINT8 codec,
+    UINT8 nlcPack,
+    UINT8 nearLevel,
+    UINT8 rgbMode,
+    UINT16 mtu,
+    bool autoReconnect,
+    UINT8 verbose,
+    bool allowOversizeModes)
+{
+    stream_config.codec = codec;
+    stream_config.nlcPack = (nlcPack == NlcPackRice) ? NlcPackRice : NlcPackTiled;
+    stream_config.nearLevel = (nearLevel > 3) ? 3 : nearLevel;
+    stream_config.rgbMode = rgbMode;
+    stream_config.mtu = mtu;
+    stream_config.autoReconnect = autoReconnect;
+    stream_config.verbose = verbose;
+    stream_config.allowOversizeModes = allowOversizeModes;
+
+    return true;
+}
+
+MISTERCASTLIB_API int ValidateModeline(
+    double pclock,
+    UINT16 hactive,
+    UINT16 hbegin,
+    UINT16 hend,
+    UINT16 htotal,
+    UINT16 vactive,
+    UINT16 vbegin,
+    UINT16 vend,
+    UINT16 vtotal,
+    bool interlace,
+    UINT8 rgbMode,
+    bool allowOversizeModes)
+{
+    nogpu_modeline candidate = {};
+    candidate.pclock = pclock;
+    candidate.hactive = hactive;
+    candidate.hbegin = hbegin;
+    candidate.hend = hend;
+    candidate.htotal = htotal;
+    candidate.vactive = vactive;
+    candidate.vbegin = vbegin;
+    candidate.vend = vend;
+    candidate.vtotal = vtotal;
+    candidate.interlace = interlace;
+
+    return (int)ValidateModelineFor(candidate, rgbMode, allowOversizeModes);
+}
+
 MISTERCASTLIB_API bool SetModeline(
     double pclock,
     UINT16 hactive,
@@ -165,17 +243,30 @@ MISTERCASTLIB_API bool SetModeline(
     bool interlace)
 {
     LogMessage("SetModeline called");
-    selected_modeline.pclock = pclock;
-    selected_modeline.hactive = hactive;
-    selected_modeline.hbegin = hbegin;
-    selected_modeline.hend = hend;
-    selected_modeline.htotal = htotal;
-    selected_modeline.vactive = vactive;
-    selected_modeline.vbegin = vbegin;
-    selected_modeline.vend = vend;
-    selected_modeline.vtotal = vtotal;
-    selected_modeline.interlace = interlace;
 
+    nogpu_modeline candidate = {};
+    candidate.pclock = pclock;
+    candidate.hactive = hactive;
+    candidate.hbegin = hbegin;
+    candidate.hend = hend;
+    candidate.htotal = htotal;
+    candidate.vactive = vactive;
+    candidate.vbegin = vbegin;
+    candidate.vend = vend;
+    candidate.vtotal = vtotal;
+    candidate.interlace = interlace;
+
+    // Refuse rather than blit past the client's buffer or drive the core's PLL
+    // into an undefined state. The previous mode stays in force.
+    ModelineValidation result = ValidateModelineFor(
+        candidate, stream_config.rgbMode, stream_config.allowOversizeModes);
+    if (result != ModelineOk)
+    {
+        LogMessage(ModelineValidationText(result), true);
+        return false;
+    }
+
+    selected_modeline = candidate;
     shouldUpdateVideoMode = true;
 
     return true;

@@ -13,9 +13,18 @@
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
       <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
     </Filter>
+    <Filter Include="Groovy">
+      <UniqueIdentifier>{2A1E9C46-5B0D-4F3E-9C1A-7D6B0E4F8A11}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Groovy\lz4">
+      <UniqueIdentifier>{6C3D8B27-1F4A-42E5-B8D9-0A5C7E2B9D34}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <None Include="cpp.hint" />
+    <None Include="PROVENANCE.md">
+      <Filter>Groovy</Filter>
+    </None>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="MiSTerCastLib.h">
@@ -34,10 +43,19 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="groovymister.h">
-      <Filter>Header Files</Filter>
+      <Filter>Groovy</Filter>
+    </ClInclude>
+    <ClInclude Include="nlc_codec.h">
+      <Filter>Groovy</Filter>
     </ClInclude>
     <ClInclude Include="rio.h">
-      <Filter>Header Files</Filter>
+      <Filter>Groovy</Filter>
+    </ClInclude>
+    <ClInclude Include="lz4\lz4.h">
+      <Filter>Groovy\lz4</Filter>
+    </ClInclude>
+    <ClInclude Include="lz4\lz4hc.h">
+      <Filter>Groovy\lz4</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -51,7 +69,16 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="groovymister.cpp">
-      <Filter>Source Files</Filter>
+      <Filter>Groovy</Filter>
+    </ClCompile>
+    <ClCompile Include="nlc_codec.cpp">
+      <Filter>Groovy</Filter>
+    </ClCompile>
+    <ClCompile Include="lz4\lz4.c">
+      <Filter>Groovy\lz4</Filter>
+    </ClCompile>
+    <ClCompile Include="lz4\lz4hc.c">
+      <Filter>Groovy\lz4</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>

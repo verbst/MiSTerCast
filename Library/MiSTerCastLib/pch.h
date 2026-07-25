@@ -23,7 +23,9 @@
 #include <math.h>
 #include <algorithm>
 #include <thread>
+#include <chrono>
 #include <atomic>
+#include <string.h>
 
 #include <MMDeviceAPI.h>
 #include <AudioClient.h>
@@ -40,12 +42,9 @@
 #include <string>
 #include <functional>
 #include <vector>
+#include <memory>
 
 #include <d3d11.h>
 #include <dxgi1_2.h>
-
-
-#include <lz4.h>
-#include <lz4hc.h>
 
 #endif //PCH_H

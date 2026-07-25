@@ -5,7 +5,7 @@
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:local="clr-namespace:MiSTerCast"
         mc:Ignorable="d"
-        Title="MiSTerCast 1.02" Height="600" Width="580"
+        Title="MiSTerCast 1.03" Height="760" Width="580"
         Activated="Window_Activated"
         Closing="MainWindow_Closing"
         Closed="Window_Closed">
@@ -43,6 +43,112 @@
                         ?
                     </Button>
                 </Grid>
+            </GroupBox>
+            <GroupBox Header="Stream" Grid.Row="1">
+                <StackPanel>
+                    <Grid Margin="10,1,10,1">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <Grid Grid.Column="0" Margin="10,0,10,0">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="*"/>
+                                <RowDefinition Height="*"/>
+                            </Grid.RowDefinitions>
+                            <Label Grid.Row="0">Codec</Label>
+                            <ComboBox Grid.Row="1" x:Name="CodecComboBox" SelectedIndex="7" SelectionChanged="StreamOption_SelectionChanged">
+                                <ComboBoxItem>Raw (no compression)</ComboBoxItem>
+                                <ComboBoxItem>LZ4</ComboBoxItem>
+                                <ComboBoxItem>LZ4 + delta</ComboBoxItem>
+                                <ComboBoxItem>LZ4HC</ComboBoxItem>
+                                <ComboBoxItem>LZ4HC + delta</ComboBoxItem>
+                                <ComboBoxItem>LZ4 adaptive</ComboBoxItem>
+                                <ComboBoxItem>LZ4 adaptive + delta</ComboBoxItem>
+                                <ComboBoxItem>NLC (near-lossless)</ComboBoxItem>
+                            </ComboBox>
+                        </Grid>
+                        <Grid Grid.Column="1" Margin="10,0,10,0">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="*"/>
+                                <RowDefinition Height="*"/>
+                            </Grid.RowDefinitions>
+                            <Label Grid.Row="0">RGB Mode</Label>
+                            <ComboBox Grid.Row="1" x:Name="RgbModeComboBox" SelectedIndex="0" SelectionChanged="StreamOption_SelectionChanged">
+                                <ComboBoxItem>RGB888</ComboBoxItem>
+                                <ComboBoxItem>RGBA8888</ComboBoxItem>
+                                <ComboBoxItem>RGB565</ComboBoxItem>
+                            </ComboBox>
+                        </Grid>
+                        <Grid Grid.Column="2" Margin="10,0,10,0">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="*"/>
+                                <RowDefinition Height="*"/>
+                            </Grid.RowDefinitions>
+                            <Label Grid.Row="0">MTU</Label>
+                            <ComboBox Grid.Row="1" x:Name="MtuComboBox" SelectedIndex="0" SelectionChanged="StreamOption_SelectionChanged">
+                                <ComboBoxItem>1500</ComboBoxItem>
+                                <ComboBoxItem>3800 (needs Jumbo frames)</ComboBoxItem>
+                            </ComboBox>
+                        </Grid>
+                    </Grid>
+                    <Grid Margin="10,1,10,1">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <Grid Grid.Column="0" Margin="10,0,10,0">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="*"/>
+                                <RowDefinition Height="*"/>
+                            </Grid.RowDefinitions>
+                            <Label Grid.Row="0" ToolTip="Rice needs a Rice-capable Groovy core. An older core misparses Rice as TILED and shows garbage with no error.">NLC Pack</Label>
+                            <ComboBox Grid.Row="1" x:Name="NlcPackComboBox" SelectedIndex="1" SelectionChanged="StreamOption_SelectionChanged"
+                                      ToolTip="Rice needs a Rice-capable Groovy core (rbf_rice_r3 or newer). An older core misparses Rice bytes as TILED and shows garbage with no error.">
+                                <ComboBoxItem>TILED</ComboBoxItem>
+                                <ComboBoxItem>Rice (needs newer core)</ComboBoxItem>
+                            </ComboBox>
+                        </Grid>
+                        <Grid Grid.Column="1" Margin="10,0,10,0">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="*"/>
+                                <RowDefinition Height="*"/>
+                            </Grid.RowDefinitions>
+                            <Label Grid.Row="0">NLC NEAR</Label>
+                            <ComboBox Grid.Row="1" x:Name="NearLevelComboBox" SelectedIndex="1" SelectionChanged="StreamOption_SelectionChanged">
+                                <ComboBoxItem>0 (lossless)</ComboBoxItem>
+                                <ComboBoxItem>1 (recommended)</ComboBoxItem>
+                                <ComboBoxItem>2</ComboBoxItem>
+                                <ComboBoxItem>3</ComboBoxItem>
+                            </ComboBox>
+                        </Grid>
+                        <Grid Grid.Column="2" Margin="10,0,10,0">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="*"/>
+                                <RowDefinition Height="*"/>
+                            </Grid.RowDefinitions>
+                            <Label Grid.Row="0">Log Level</Label>
+                            <ComboBox Grid.Row="1" x:Name="LogLevelComboBox" SelectedIndex="0" SelectionChanged="StreamOption_SelectionChanged">
+                                <ComboBoxItem>0 (errors)</ComboBoxItem>
+                                <ComboBoxItem>1 (+ telemetry)</ComboBoxItem>
+                                <ComboBoxItem>2 (full trace)</ComboBoxItem>
+                            </ComboBox>
+                        </Grid>
+                    </Grid>
+                    <Grid Margin="20,4,20,2">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <CheckBox Grid.Column="0" x:Name="AutoReconnectCheckBox" IsChecked="True" Checked="StreamOption_Checked" Unchecked="StreamOption_Checked"
+                                  ToolTip="Rebuild the session automatically if the core restarts or the link drops.">Auto-reconnect</CheckBox>
+                        <CheckBox Grid.Column="1" x:Name="AllowOversizeCheckBox" IsChecked="False" Checked="StreamOption_Checked" Unchecked="StreamOption_Checked"
+                                  ToolTip="Permit modes larger than a fixed-frequency CRT should be asked to sync. The frame size limit still applies.">Allow oversize modes</CheckBox>
+                    </Grid>
+                    <TextBlock x:Name="ModelineWarningText" Margin="20,0,20,4" TextWrapping="Wrap" Foreground="#B00000" Visibility="Collapsed"/>
+                </StackPanel>
             </GroupBox>
             <Grid Grid.Row="2">
                 <Grid.ColumnDefinitions>

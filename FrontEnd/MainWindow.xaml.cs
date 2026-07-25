@@ -61,7 +61,9 @@ namespace MiSTerCast
             isInitialized = MiSTerCastInterop.Initialize(LogDelegate, CaptureImageDelegate);
             if (isInitialized)
             {
-                OnModelineChanged();
+                // Push the stream options first: the modeline's byte budget
+                // depends on the RGB mode, so validation needs them in place.
+                OnStreamOptionsChanged();
             }
         }
 
@@ -155,6 +157,7 @@ namespace MiSTerCast
                     CaptureSourceBox.IsEnabled = true;
                     EnableAudioCheckBox.IsEnabled = true;
                     ApplyModelineButton.IsEnabled = false;
+                    SetStreamControlsEnabled(true);
                 }
             }
             else
@@ -164,6 +167,15 @@ namespace MiSTerCast
 
                 if (isInitialized)
                 {
+                    // The modeline gate is the only thing between a mistyped mode
+                    // and the FPGA, so refuse to start rather than blit past the
+                    // Groovy client's buffer.
+                    if (!ValidateCurrentModeline())
+                    {
+                        Log("Cannot start: the current modeline was rejected.", true);
+                        return;
+                    }
+
                     EnablePreviewCheckBox.IsChecked = false;
                     IPAddress ipAddress = null;
                     if (!IPAddress.TryParse(TargetIpAddresTextBox.Text, out ipAddress))
@@ -185,14 +197,75 @@ namespace MiSTerCast
                         ToggleStreamButton.Content = "Stop Stream";
                         CaptureSourceBox.IsEnabled = false;
                         EnableAudioCheckBox.IsEnabled = false;
+                        // Codec, RGB mode and MTU ride CMD_INIT; they cannot be
+                        // changed until the session is torn down and rebuilt.
+                        SetStreamControlsEnabled(false);
                     }
                 }
             }
         }
 
+        #region Stream Options
+
+        // Everything in this region rides CMD_INIT and so takes effect at the
+        // next Start Stream, not on the running session.
+
+        private void OnStreamOptionsChanged()
+        {
+            if (!isInitialized)
+                return;
+
+            bool isNlc = CodecComboBox.SelectedIndex == (int)MiSTerCastInterop.Codec.NLC;
+
+            MiSTerCastInterop.SetStreamOptions(
+                (byte)CodecComboBox.SelectedIndex,
+                (byte)(NlcPackComboBox.SelectedIndex == 1
+                    ? MiSTerCastInterop.NlcPack.Rice
+                    : MiSTerCastInterop.NlcPack.Tiled),
+                (byte)NearLevelComboBox.SelectedIndex,
+                (byte)RgbModeComboBox.SelectedIndex,
+                (UInt16)(MtuComboBox.SelectedIndex == 1 ? 3800 : 1500),
+                AutoReconnectCheckBox.IsChecked.Value,
+                (byte)LogLevelComboBox.SelectedIndex,
+                AllowOversizeCheckBox.IsChecked.Value);
+
+            NlcPackComboBox.IsEnabled = isNlc && !isStreaming;
+            NearLevelComboBox.IsEnabled = isNlc && !isStreaming;
+
+            // The byte budget is in bytes, not pixels, so a change of RGB mode
+            // can invalidate a modeline that was fine a moment ago.
+            OnModelineChanged();
+        }
+
+        private void SetStreamControlsEnabled(bool enabled)
+        {
+            bool isNlc = CodecComboBox.SelectedIndex == (int)MiSTerCastInterop.Codec.NLC;
+
+            CodecComboBox.IsEnabled = enabled;
+            RgbModeComboBox.IsEnabled = enabled;
+            MtuComboBox.IsEnabled = enabled;
+            LogLevelComboBox.IsEnabled = enabled;
+            AutoReconnectCheckBox.IsEnabled = enabled;
+            AllowOversizeCheckBox.IsEnabled = enabled;
+            NlcPackComboBox.IsEnabled = enabled && isNlc;
+            NearLevelComboBox.IsEnabled = enabled && isNlc;
+        }
+
+        private void StreamOption_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            OnStreamOptionsChanged();
+        }
+
+        private void StreamOption_Checked(object sender, RoutedEventArgs e)
+        {
+            OnStreamOptionsChanged();
+        }
+
+        #endregion Stream Options
+
         #region Settings
 
-        const int SettingsVersion = 1;
+        const int SettingsVersion = 2;
 
         private void SaveSettingsButton_Click(object sender, RoutedEventArgs e)
         {
@@ -239,6 +312,16 @@ namespace MiSTerCast
                                 sw.WriteLine(CaptureHeight.Text);
                                 sw.WriteLine(CaptureXOffset.Text);
                                 sw.WriteLine(CaptureYOffset.Text);
+
+                                // Version 2 additions, appended so version 1 files still load.
+                                sw.WriteLine(CodecComboBox.SelectedIndex);
+                                sw.WriteLine(NlcPackComboBox.SelectedIndex);
+                                sw.WriteLine(NearLevelComboBox.SelectedIndex);
+                                sw.WriteLine(RgbModeComboBox.SelectedIndex);
+                                sw.WriteLine(MtuComboBox.SelectedIndex);
+                                sw.WriteLine(AutoReconnectCheckBox.IsChecked.Value ? 1 : 0);
+                                sw.WriteLine(LogLevelComboBox.SelectedIndex);
+                                sw.WriteLine(AllowOversizeCheckBox.IsChecked.Value ? 1 : 0);
 
                                 Log("Settings saved.");
                             }
@@ -319,6 +402,30 @@ namespace MiSTerCast
             CaptureHeight.Text = sr.ReadLine();
             CaptureXOffset.Text = sr.ReadLine();
             CaptureYOffset.Text = sr.ReadLine();
+
+            if (settingsVersion >= 2)
+            {
+                CodecComboBox.SelectedIndex = Math.Min(int.Parse(sr.ReadLine()), CodecComboBox.Items.Count - 1);
+                NlcPackComboBox.SelectedIndex = Math.Min(int.Parse(sr.ReadLine()), NlcPackComboBox.Items.Count - 1);
+                NearLevelComboBox.SelectedIndex = Math.Min(int.Parse(sr.ReadLine()), NearLevelComboBox.Items.Count - 1);
+                RgbModeComboBox.SelectedIndex = Math.Min(int.Parse(sr.ReadLine()), RgbModeComboBox.Items.Count - 1);
+                MtuComboBox.SelectedIndex = Math.Min(int.Parse(sr.ReadLine()), MtuComboBox.Items.Count - 1);
+                AutoReconnectCheckBox.IsChecked = sr.ReadLine() == "1" ? true : false;
+                LogLevelComboBox.SelectedIndex = Math.Min(int.Parse(sr.ReadLine()), LogLevelComboBox.Items.Count - 1);
+                AllowOversizeCheckBox.IsChecked = sr.ReadLine() == "1" ? true : false;
+            }
+            else
+            {
+                // A version 1 file predates these settings; it was written by a
+                // build that always used LZ4 / RGB888 / MTU 1500, so keep that
+                // rather than silently moving the user onto NLC.
+                CodecComboBox.SelectedIndex = (int)MiSTerCastInterop.Codec.LZ4;
+                RgbModeComboBox.SelectedIndex = (int)MiSTerCastInterop.RgbMode.Rgb888;
+                MtuComboBox.SelectedIndex = 0;
+                Log("Loaded a version 1 settings file: codec kept at LZ4, as that is what it was saved with.");
+            }
+
+            OnStreamOptionsChanged();
 
             Log("Settings loaded.");
         }
@@ -519,7 +626,7 @@ namespace MiSTerCast
             ushort.TryParse(vtotalTextBox.Text, out currentModeLine.vtotal);
             currentModeLine.interlace = interlacedCheckBox.IsChecked.Value;
 
-            if (isInitialized && currentModeLine.pclock > 0 && currentModeLine.hactive > 0 && currentModeLine.vactive > 0)
+            if (isInitialized && ValidateCurrentModeline())
             {
                 MiSTerCastInterop.SetModeline(
                     currentModeLine.pclock,
@@ -536,6 +643,80 @@ namespace MiSTerCast
                 UpdateCropSize();
                 OnCaptureSourceChanged();
             }
+        }
+
+        // Groovy integration handoff section 4.7. MiSTerCast takes modelines from
+        // the user and from modelines.dat with no switchres preset bounding them,
+        // so this check is the only thing keeping a bad one off the wire - and a
+        // large one inside the client's fixed frame buffer.
+        private const int GroovyFrameBufferBytes = 1245312; // BUFFER_SIZE, 720x576x3
+
+        private bool ValidateCurrentModeline()
+        {
+            if (!isInitialized)
+                return false;
+
+            byte rgbMode = (byte)RgbModeComboBox.SelectedIndex;
+            bool allowOversize = AllowOversizeCheckBox.IsChecked.Value;
+
+            var result = (MiSTerCastInterop.ModelineValidation)MiSTerCastInterop.ValidateModeline(
+                currentModeLine.pclock,
+                currentModeLine.hactive,
+                currentModeLine.hbegin,
+                currentModeLine.hend,
+                currentModeLine.htotal,
+                currentModeLine.vactive,
+                currentModeLine.vbegin,
+                currentModeLine.vend,
+                currentModeLine.vtotal,
+                currentModeLine.interlace,
+                rgbMode,
+                allowOversize);
+
+            string message = null;
+            switch (result)
+            {
+                case MiSTerCastInterop.ModelineValidation.Malformed:
+                    message = "Modeline is malformed. The pixel clock must be positive and the blanking must "
+                            + "enclose the active area (hbegin >= hactive, hend >= hbegin, htotal > hend, "
+                            + "and the same vertically).";
+                    break;
+
+                case MiSTerCastInterop.ModelineValidation.OverByteBudget:
+                    {
+                        int bpp = rgbMode == (byte)MiSTerCastInterop.RgbMode.Rgba8888 ? 4
+                                : rgbMode == (byte)MiSTerCastInterop.RgbMode.Rgb565 ? 2 : 3;
+                        int bytes = currentModeLine.hactive * currentModeLine.vactive * bpp;
+                        if (currentModeLine.interlace)
+                            bytes /= 2;
+                        message = string.Format(
+                            "Frame is too large for the Groovy client: {0} x {1} x {2} bytes = {3:N0}, "
+                            + "limit {4:N0}. Reduce the resolution, use RGB565, or use an interlaced mode.",
+                            currentModeLine.hactive, currentModeLine.vactive, bpp, bytes, GroovyFrameBufferBytes);
+                    }
+                    break;
+
+                case MiSTerCastInterop.ModelineValidation.OverCrtEnvelope:
+                    message = "Modeline is larger than 1024 x 576, which is beyond what a fixed-frequency CRT "
+                            + "should be asked to sync. Tick 'Allow oversize modes' if your display can take it.";
+                    break;
+            }
+
+            if (message == null)
+            {
+                ModelineWarningText.Visibility = Visibility.Collapsed;
+                ModelineWarningText.Text = string.Empty;
+            }
+            else
+            {
+                ModelineWarningText.Text = message;
+                ModelineWarningText.Visibility = Visibility.Visible;
+            }
+
+            // Keep Stop reachable if a mode is edited to something invalid mid-stream.
+            ToggleStreamButton.IsEnabled = (message == null) || isStreaming;
+
+            return message == null;
         }
 
         private void ApplyModelineButton_Click(object sender, RoutedEventArgs e)

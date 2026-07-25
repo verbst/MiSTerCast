@@ -34,6 +34,12 @@ inline double get_ms(uint64_t ticks) { return (double)ticks / TicksPerSecond() *
 // nogpu UDP server
 #define UDP_PORT 32100
 
+// Largest active area a fixed-frequency CRT should be asked to sync. Advisory
+// rather than protective - the byte budget below is the one that keeps us inside
+// the client's frame buffer - so the user can acknowledge past it.
+#define CRT_ENVELOPE_WIDTH  1024
+#define CRT_ENVELOPE_HEIGHT 576
+
 #pragma pack(1)
 
 typedef struct nogpu_modeline
@@ -55,14 +61,74 @@ nogpu_modeline selected_modeline = {};
 
 #pragma pack()
 
+// Applied at the next CmdInit - see StreamOptions in MiSTerCastLib.h.
+StreamOptions stream_config = {};
+
+inline uint8_t BytesPerPixel(uint8_t rgbMode)
+{
+    switch (rgbMode)
+    {
+    case RgbMode::Rgba8888: return 4;
+    case RgbMode::Rgb565:   return 2;
+    default:                return 3;
+    }
+}
+
+//============================================================
+//  ValidateModelineFor
+//
+//  Groovy integration handoff section 4.7. MiSTerCast accepts modelines typed by
+//  the user and from modelines.dat, with no switchres preset bounding them, so
+//  this is the only thing standing between a mistyped mode and the FPGA - and
+//  the only thing keeping a large one inside the client's fixed frame buffer.
+//============================================================
+
+inline ModelineValidation ValidateModelineFor(const nogpu_modeline& m, uint8_t rgbMode, bool allowOversize)
+{
+    // Well-formedness: blanking must enclose the active area, or the core's PLL
+    // is driven into an undefined state.
+    if (m.pclock <= 0.0 || m.hactive == 0 || m.vactive == 0)
+        return ModelineMalformed;
+    if (m.hbegin < m.hactive || m.hend < m.hbegin || m.htotal <= m.hend)
+        return ModelineMalformed;
+    if (m.vbegin < m.vactive || m.vend < m.vbegin || m.vtotal <= m.vend)
+        return ModelineMalformed;
+
+    // Byte budget. Mirrors the client's own m_RGBSize arithmetic: the halving
+    // applies to interlaced field blits only. Nothing in the client clamps this.
+    uint32_t bytes = (uint32_t)m.hactive * m.vactive * BytesPerPixel(rgbMode);
+    if (m.interlace)
+        bytes >>= 1;
+    if (bytes > BUFFER_SIZE)
+        return ModelineOverByteBudget;
+
+    if (!allowOversize && (m.hactive > CRT_ENVELOPE_WIDTH || m.vactive > CRT_ENVELOPE_HEIGHT))
+        return ModelineOverCrtEnvelope;
+
+    return ModelineOk;
+}
+
+inline const char* ModelineValidationText(ModelineValidation result)
+{
+    switch (result)
+    {
+    case ModelineMalformed:
+        return "Modeline rejected: blanking must enclose the active area and the pixel clock must be positive.";
+    case ModelineOverByteBudget:
+        return "Modeline rejected: the frame is larger than the Groovy client's buffer. Reduce the resolution or pick a smaller RGB mode.";
+    case ModelineOverCrtEnvelope:
+        return "Modeline rejected: larger than a fixed-frequency CRT should be asked to sync. Tick 'Allow oversize modes' to override.";
+    default:
+        return "Modeline accepted.";
+    }
+}
+
 // renderer_nogpu is the information for the current screen
 class renderer_nogpu
 {
 public:
     renderer_nogpu(std::string targetip)
-        : m_bmdata(nullptr)
-        , m_bmsize(0)
-        , m_targetip(targetip)
+        : m_targetip(targetip)
     {
     }
 
@@ -72,17 +138,13 @@ public:
     void save() {}
     void record() {}
     void toggle_fsfx() {}
-    void add_audio_to_recording(const uint16_t *buffer, int samples_this_frame);
+    void add_audio_to_recording();
 
 private:
-    std::unique_ptr<uint8_t[]> m_bmdata;
-    size_t                      m_bmsize;
-
     // npgpu private members
     GroovyMister groovyMister;
     bool m_initialized = false;
     bool m_first_blit = true;
-    int m_compression = 0;
     int m_frame = 0;
     int m_field = 0;
     unsigned int m_width = 0;
@@ -111,6 +173,7 @@ private:
     bool nogpu_init();
     bool nogpu_switch_video_mode();
     void nogpu_register_frametime(uint64_t frametime);
+    void nogpu_pack_frame(char* fb);
 };
 
 //============================================================
@@ -132,7 +195,140 @@ renderer_nogpu::~renderer_nogpu()
     SleepTicks(uint64_t(m_period * time_sleep));
 
     LogMessage("Sending CMD_CLOSE...");
+    // Issued from the thread that owns the socket, which is what lets the core
+    // return to connection-search instead of freezing on the last frame.
     groovyMister.CmdClose();
+}
+
+//============================================================
+//  renderer_nogpu::nogpu_pack_frame
+//
+//  Scale the captured desktop into the modeline's active area and write it to
+//  the client's registered blit buffer.
+//
+//  Both the rotation and the pixel-format decisions are resolved once per frame
+//  rather than once per pixel: rotation becomes a pair of integer coefficients,
+//  and the format selects the loop. The capture is DXGI BGRA, and the wire wants
+//  B,G,R - so for RGB888/RGBA the first three source bytes copy straight across.
+//============================================================
+
+void renderer_nogpu::nogpu_pack_frame(char* fb)
+{
+    const unsigned int drawIndex = lastVideoCaptureIndex;
+    const Bitmap& capture = videoCaptures[drawIndex];
+    const uint8_t* src = capture.buffer.data();
+    const int screenwidth = capture.width;
+    const int screenheight = capture.height;
+
+    if (screenwidth <= 0 || screenheight <= 0 || src == nullptr)
+        return;
+
+    // Which of the two interlaced fields this blit samples.
+    bool drawInt = (m_field == 0);
+    if (source_config.rotation != Rotation::None)
+        drawInt = !drawInt;
+
+    // The 90 degree rotations transpose, so destination x walks the source's
+    // vertical axis and the modeline's active area is sampled height-first.
+    const bool transposed = (source_config.rotation == Rotation::CW90 ||
+                             source_config.rotation == Rotation::CCW90);
+
+    const float stepx = transposed ? ((float)screenwidth / (float)m_height)
+                                   : ((float)screenwidth / (float)m_width);
+    const float stepy = transposed ? ((float)screenheight / (float)m_width)
+                                   : ((float)screenheight / (float)m_height);
+
+    int interlaceStepX = 0;
+    int interlaceStepY = 0;
+    if (m_current_mode.interlace && drawInt)
+    {
+        if (transposed)
+            interlaceStepX = int(stepx / 2.0f);
+        else
+            interlaceStepY = int(stepy / 2.0f);
+    }
+
+    // Source coordinate as an affine function of the destination coordinate,
+    // so the rotation costs no per-pixel branch:
+    //   sx = (kxx*x + kxy*y + kx0) * stepx,  sy = (kyx*x + kyy*y + ky0) * stepy
+    int kxx = 1, kxy = 0, kx0 = 0;
+    int kyx = 0, kyy = 1, ky0 = 0;
+    switch (source_config.rotation)
+    {
+    case Rotation::CW90:
+        kxx = 0; kxy = -1; kx0 = (int)m_height - 1;
+        kyx = 1; kyy = 0;  ky0 = 0;
+        break;
+    case Rotation::CCW90:
+        kxx = 0; kxy = 1;  kx0 = 0;
+        kyx = -1; kyy = 0; ky0 = (int)m_width - 1;
+        break;
+    case Rotation::Flip180:
+        kxx = -1; kxy = 0; kx0 = (int)m_width - 1;
+        kyx = 0; kyy = -1; ky0 = (int)m_height - 1;
+        break;
+    default:
+        break;
+    }
+
+    auto sourceOffset = [&](unsigned int x, unsigned int y) -> int
+    {
+        int sx = int((kxx * (int)x + kxy * (int)y + kx0) * stepx) + interlaceStepX;
+        int sy = int((kyx * (int)x + kyy * (int)y + ky0) * stepy) + interlaceStepY;
+
+        // Clamp rather than skip: skipping would shift every later pixel.
+        if (sx < 0) sx = 0; else if (sx >= screenwidth) sx = screenwidth - 1;
+        if (sy < 0) sy = 0; else if (sy >= screenheight) sy = screenheight - 1;
+
+        return (sy * screenwidth + sx) * 4;
+    };
+
+    switch (stream_config.rgbMode)
+    {
+    case RgbMode::Rgba8888:
+        for (unsigned int y = 0; y < m_height; y++)
+        {
+            char* dst = fb + (size_t)y * m_width * 4;
+            for (unsigned int x = 0; x < m_width; x++, dst += 4)
+            {
+                const uint8_t* s = src + sourceOffset(x, y);
+                dst[0] = (char)s[0]; // B
+                dst[1] = (char)s[1]; // G
+                dst[2] = (char)s[2]; // R
+                dst[3] = (char)s[3]; // A - carried but not displayed
+            }
+        }
+        break;
+
+    case RgbMode::Rgb565:
+        for (unsigned int y = 0; y < m_height; y++)
+        {
+            uint16_t* dst = (uint16_t*)(fb + (size_t)y * m_width * 2);
+            for (unsigned int x = 0; x < m_width; x++, dst++)
+            {
+                const uint8_t* s = src + sourceOffset(x, y);
+                // Little-endian uint16: R in 15:11, G in 10:5, B in 4:0.
+                *dst = (uint16_t)(((s[2] & 0xF8) << 8) |
+                                  ((s[1] & 0xFC) << 3) |
+                                  ( s[0] >> 3));
+            }
+        }
+        break;
+
+    default: // RgbMode::Rgb888
+        for (unsigned int y = 0; y < m_height; y++)
+        {
+            char* dst = fb + (size_t)y * m_width * 3;
+            for (unsigned int x = 0; x < m_width; x++, dst += 3)
+            {
+                const uint8_t* s = src + sourceOffset(x, y);
+                dst[0] = (char)s[0]; // B
+                dst[1] = (char)s[1]; // G
+                dst[2] = (char)s[2]; // R
+            }
+        }
+        break;
+    }
 }
 
 //============================================================
@@ -143,26 +339,6 @@ void renderer_nogpu::draw()
     // Hack because these aren't intiailized...
     m_width = selected_modeline.hactive;
     m_height = selected_modeline.interlace ? selected_modeline.vactive / 2 : selected_modeline.vactive;
-
-    // resize window if required
-    static int old_width = 0;
-    static int old_height = 0;
-    if (old_width != m_width || old_height != m_height)
-    {
-        old_width = m_width;
-        old_height = m_height;
-    }
-
-    // compute pitch of target
-    unsigned int const pitch = (m_width + 3) & ~3;
-
-    // make sure our temporary bitmap is big enough
-    if ((pitch * m_height * 4) > m_bmsize)
-    {
-        m_bmsize = pitch * m_height * 4 * 2;
-        m_bmdata.reset();
-        m_bmdata = std::make_unique<uint8_t[]>(m_bmsize);
-    }
 
     // initialize nogpu right before first blit
     if (m_first_blit && !m_initialized)
@@ -185,7 +361,7 @@ void renderer_nogpu::draw()
 
     m_frame++;
 
-    if (groovyMister.fpga.frame > m_frame)
+    if (groovyMister.fpga.frame > (uint32_t)m_frame)
         m_frame = groovyMister.fpga.frame + 1;
 
     // get current field for interlaced mode
@@ -194,87 +370,11 @@ void renderer_nogpu::draw()
     else
         m_field = 0;
 
-    unsigned int drawIndex = lastVideoCaptureIndex;
-    int screenwidth = videoCaptures[drawIndex].width;
-    int screenheight = videoCaptures[drawIndex].height;
-    bool drawInt = (m_field == 0);
-
-    int j = 0;
-    
-    float stepx;
-    float stepy;
-    int interlaceStepX = 0;
-    int interlaceStepY = 0;
-    switch (source_config.rotation)
-    {
-    case Rotation::CW90:
-        stepx = ((float)(screenwidth) / (float)m_height);
-        stepy = ((float)(screenheight) / (float)m_width);
-        interlaceStepX = int(stepx / 2.0f);
-    case Rotation::CCW90:
-        stepx = ((float)(screenwidth) / (float)m_height);
-        stepy = ((float)(screenheight) / (float)m_width);
-        interlaceStepX = int(stepx / 2.0f);
-        drawInt = !drawInt;
-        break;
-    case Rotation::Flip180:
-        stepx = ((float)(screenwidth) / (float)m_width);
-        stepy = ((float)(screenheight) / (float)m_height);
-        interlaceStepY = int(stepy / 2.0f);
-        drawInt = !drawInt;
-    default:
-        stepx = ((float)(screenwidth) / (float)m_width);
-        stepy = ((float)(screenheight) / (float)m_height);
-        interlaceStepY = int(stepy / 2.0f);
-        break;
-    }
-
-    char* fb = groovyMister.getPBufferBlit(m_field);
-    for (unsigned int i = 0; i < (pitch * m_height * 4); i += 4)
-    {
-        int x = (i / 4) % m_width;
-        int y = (i / 4) / m_width;
-        int tx = x;
-        switch (source_config.rotation)
-        {
-        case Rotation::CW90:
-            x = m_height - y - 1;
-            y = tx;
-            break;
-        case Rotation::CCW90:
-            x = y;
-            y = m_width - tx - 1;
-            break;
-        case Rotation::Flip180:
-            x = m_width - x - 1;
-            y = m_height - y - 1;
-            break;
-        }
-
-        int bmpx = int(x * stepx);
-        int bmpy = int(y * stepy);
-        if (m_current_mode.interlace && drawInt)
-        {
-            bmpx += interlaceStepX;
-            bmpy += interlaceStepY;
-        }
-        int bmpi = (bmpy * screenwidth + bmpx) * 4;
-        if (bmpi + 4 >= (screenheight * screenwidth * 4))
-            continue;
-
-        
-        fb[j] =     (char)videoCaptures[drawIndex].buffer[bmpi];
-        fb[j + 1] = (char)videoCaptures[drawIndex].buffer[bmpi + 1];
-        fb[j + 2] = (char)videoCaptures[drawIndex].buffer[bmpi + 2];
-
-        j += 3;
-    }
+    nogpu_pack_frame(groovyMister.getPBufferBlit(m_field));
 
     // change video mode right before the blit
     if (shouldUpdateVideoMode)
         nogpu_switch_video_mode();
-
-    bool valid_status = true;
 
     time_entry = CurrentTicks();
 
@@ -308,7 +408,7 @@ void renderer_nogpu::draw()
     {
         TickAudioCapture();
         if (AudioWritePos > 0)
-            add_audio_to_recording(audioBuffer, AudioWritePos);
+            add_audio_to_recording();
     }
 
     // Update vsync scanline
@@ -331,39 +431,70 @@ void renderer_nogpu::draw()
 
 bool renderer_nogpu::nogpu_init()
 {
-    int result;
-
-    m_compression = 0x01; // lz4 compression
-
-    switch (audioSampleRate)
-    {
-    case 22050:
-        LogMessage("Audio Freq 22.05KHz");
-        break;
-    case 44100:
-        LogMessage("Audio Freq 44.1KHz");
-        break;
-    case 48000:
-        LogMessage("Audio Freq 48KHz");
-        break;
-    default:
-        LogMessage("Unsupported audio sample rate. Only 48kHz, 44.1kHz and 22.05kHz are supported.");
-    }
-
-    LogMessage("Sending CMD_INIT...");
-
     // Reset current mode
     m_current_mode = {};
 
-    int ret = groovyMister.CmdInit(m_targetip.c_str(), UDP_PORT, m_compression, audioSampleRate, 2, 0, 1500);
+    // The client maps anything outside 22050/44100/48000 to "audio off" in
+    // CMD_INIT, which is invisible from here - so say so plainly instead.
+    uint32_t soundRate = 0;
+    uint8_t soundChan = 0;
+    if (source_config.audio)
+    {
+        switch (audioSampleRate)
+        {
+        case 22050:
+        case 44100:
+        case 48000:
+            soundRate = (uint32_t)audioSampleRate;
+            soundChan = 2; // capture is downmixed to stereo
+            LogMessage("Audio rate " + std::to_string((int)audioSampleRate) + " Hz, stereo.");
+            break;
+        default:
+            LogMessage("Windows is mixing at " + std::to_string((int)audioSampleRate) +
+                " Hz, which Groovy does not accept (22050, 44100 or 48000 only). Audio is disabled - "
+                "set your playback device's format to 48000 Hz and restart the stream.", true);
+            break;
+        }
+    }
+
+    groovyMister.setVerbose(stream_config.verbose);
+    groovyMister.setAutoReconnect(stream_config.autoReconnect ? 1 : 0);
+
+    // Pre-init only: these ride CMD_INIT byte[1] and must precede it.
+    if (stream_config.codec == CodecNLC)
+    {
+        groovyMister.setNlcPack(stream_config.nlcPack);
+        groovyMister.setNearLevel(stream_config.nearLevel);
+    }
+
+    std::string summary = "Sending CMD_INIT... codec " + std::to_string(stream_config.codec);
+    if (stream_config.codec == CodecNLC)
+    {
+        summary += (stream_config.nlcPack == NlcPackRice) ? " (NLC, Rice pack" : " (NLC, TILED pack";
+        summary += ", NEAR " + std::to_string(stream_config.nearLevel) + ")";
+    }
+    summary += ", rgb mode " + std::to_string(stream_config.rgbMode) +
+               ", mtu " + std::to_string(stream_config.mtu) +
+               ", auto-reconnect " + (stream_config.autoReconnect ? "on" : "off");
+    LogMessage(summary);
+
+    int ret = groovyMister.CmdInit(
+        m_targetip.c_str(),
+        UDP_PORT,
+        stream_config.codec,
+        soundRate,
+        soundChan,
+        stream_config.rgbMode,
+        stream_config.mtu);
+
     if (ret == 0)
     {
-        audioBuffer = (uint16_t*)groovyMister.getPBufferAudio();
+        audioBuffer = (int16_t*)groovyMister.getPBufferAudio();
         return true;
     }
     else
     {
-        LogMessage("Groovy MiSTer API failed to initialize!");
+        LogMessage("Groovy MiSTer API failed to initialize!", true);
         return false;
     }
 }
@@ -454,10 +585,13 @@ void renderer_nogpu::nogpu_register_frametime(uint64_t frametime)
 //  renderer_nogpu::add_audio_to_recording
 //============================================================
 
-void renderer_nogpu::add_audio_to_recording(const uint16_t *buffer, int samples_this_frame)
+void renderer_nogpu::add_audio_to_recording()
 {
     if (!groovyMister.fpga.audio)
         return;
 
-    groovyMister.CmdAudio(samples_this_frame << 1);
+    // AudioWritePos counts int16 samples and TickAudioCapture caps it at
+    // AUDIO_MAX_SAMPLES, so this always fits CmdAudio's uint16 byte count and
+    // is always a whole number of stereo frames.
+    groovyMister.CmdAudio((uint16_t)(AudioWritePos << 1));
 }
