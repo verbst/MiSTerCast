@@ -1,3 +1,10 @@
+# Fork Notes
+This fork extends MiSTerCast to support new features to Groovy from https://github.com/verbst/Groovy_MiSTer.
+An updated core is required, this branch assumes no backwards compatibility.
+
+All testing performed using MiSTerCade CRT output.
+
+
 # MiSTerCast
 A general-purpose tool for streaming your Windows PC screen to your MiSTer through the Groovy_MiSTer core.
 
