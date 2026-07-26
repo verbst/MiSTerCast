@@ -4,6 +4,8 @@ An updated core is required, this branch assumes no backwards compatibility.
 
 All testing performed using MiSTerCade CRT output.
 
+<img width="563" height="748" alt="1" src="https://github.com/user-attachments/assets/b69a8ee7-0374-4440-b660-167ac2fdbc56" />
+
 
 # MiSTerCast
 A general-purpose tool for streaming your Windows PC screen to your MiSTer through the Groovy_MiSTer core.
