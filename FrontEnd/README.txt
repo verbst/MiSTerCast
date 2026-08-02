@@ -1,10 +1,18 @@
+<Bold>MiSTerCast 1.04</Bold>
+
+Updated reconnection code to be more reliable and to remove post-connect graphical issue.
+
+This version requires an updated set of Groovy_MiSTer NLC files are required to be deployed on your MiSTer.
+<Hyperlink>https://github.com/verbst/Groovy_MiSTer</Hyperlink>
+
+
 <Bold>MiSTerCast 1.03</Bold>
 
-MiSTerCast is a general-purpose tool for streaming your PC screen to your MiSTer through the Groovy_MiSTer core. This is not a replacement for Groovy_Mame or other integrated emulators.
+MiSTerCast is a general-purpose tool for streaming your PC screen to your MiSTer through the Groovy_MiSTer core. 
+This is not a replacement for Groovy_Mame or other integrated emulators.
 
-Make sure you already have Groovy_Mame working well with Groovy_MiSTer before using MiSTerCast. A direct ethernet connection to your MiSTer is recommended.
-<Hyperlink>https://github.com/lutechsource/MiSTerStuff/blob/main/GroovyMiSTer/mame_documentation.md</Hyperlink>
-<Hyperlink>https://github.com/psakhis/Groovy_MiSTer</Hyperlink>
+An ethernet connection to your MiSTer is recommended.
+<Hyperlink>https://github.com/verbst/Groovy_MiSTer</Hyperlink>
 
 The Microsoft VC++ x64 Redistributable is required for the standard build.
 
