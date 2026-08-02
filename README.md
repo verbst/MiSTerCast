@@ -4,7 +4,7 @@ An updated core is required, this branch assumes no backwards compatibility.
 
 All testing performed using MiSTerCade CRT output.
 
-<img width="563" height="748" alt="1" src="https://github.com/user-attachments/assets/b69a8ee7-0374-4440-b660-167ac2fdbc56" />
+<img width="549" height="692" alt="1" src="https://github.com/user-attachments/assets/f5a51d57-44b6-4613-b238-93c7f8a9d1e9" />
 
 
 # MiSTerCast
