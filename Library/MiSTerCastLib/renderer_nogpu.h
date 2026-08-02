@@ -145,6 +145,7 @@ private:
     GroovyMister groovyMister;
     bool m_initialized = false;
     bool m_first_blit = true;
+    uint32_t m_lastReconnectEpoch = 0;
     int m_frame = 0;
     int m_field = 0;
     unsigned int m_width = 0;
@@ -340,8 +341,10 @@ void renderer_nogpu::draw()
     m_width = selected_modeline.hactive;
     m_height = selected_modeline.interlace ? selected_modeline.vactive / 2 : selected_modeline.vactive;
 
-    // initialize nogpu right before first blit
-    if (m_first_blit && !m_initialized)
+    // initialize nogpu right before first blit; retry with a backoff on failure
+    // instead of giving up forever (a wrong IP / core not yet running must not
+    // pin this thread at 100% CPU doing nothing).
+    if (!m_initialized)
     {
         m_initialized = nogpu_init();
         if (m_initialized)
@@ -351,13 +354,22 @@ void renderer_nogpu::draw()
         }
         else
         {
-            m_first_blit = false;
+            SleepTicks(TicksPerSecond()); // back off before the next connection attempt
+            return;
         }
     }
 
-    // only send frame if nogpu is initialized
-    if (!m_initialized)
-        return;
+    // A reconnect restarts the core's own frame counter (resetSessionState()
+    // zeroes fpga.* + the client's m_frame at the top of every CmdInit) - realign
+    // ours to match, or the catch-up logic below (which only corrects the host
+    // being BEHIND the core) would leave a stale, much-larger m_frame diverged
+    // from the fresh session indefinitely.
+    uint32_t reconnectEpoch = groovyMister.reconnectEpoch();
+    if (reconnectEpoch != m_lastReconnectEpoch)
+    {
+        m_lastReconnectEpoch = reconnectEpoch;
+        m_frame = 0;
+    }
 
     m_frame++;
 
@@ -519,8 +531,7 @@ bool renderer_nogpu::nogpu_switch_video_mode()
     m_vtotal = mode->vtotal;
     m_field = 0;
 
-    shouldUpdateVideoMode = false;
-    groovyMister.CmdSwitchres(
+    int ret = groovyMister.CmdSwitchres(
         mode->pclock,
         mode->hactive,
         mode->hbegin,
@@ -533,6 +544,19 @@ bool renderer_nogpu::nogpu_switch_video_mode()
         mode->interlace
     );
 
+    if (ret != 0)
+    {
+        // Unconfirmed: the core has no modeline and will silently discard every
+        // subsequent video packet until one lands (no self-recovery on its own).
+        // Set shouldUpdateVideoMode so draw() retries this on the next frame,
+        // regardless of which call site (initial connect or a user-triggered
+        // mode change) got us here.
+        LogMessage("CmdSwitchres was not acknowledged; will retry.", true);
+        shouldUpdateVideoMode = true;
+        return false;
+    }
+
+    shouldUpdateVideoMode = false;
     return true;
 }
 
