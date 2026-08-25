@@ -8,7 +8,7 @@ MiSTerCast is a low-latency Windows desktop sender for Groovy_MiSTer. Correct fi
 
 Do not assume that behavior from another platform is automatically appropriate for Windows. This sender uses Desktop Duplication, WASAPI, Windows Registered I/O (RIO), and the FPGA acknowledgement clock. Any pacing or buffering change needs deterministic tests and a direct-Ethernet frame-counter test before it becomes the default.
 
-The supported build is `Release|x86`. The x64 project configuration is not a supported deliverable.
+Both `Release|x86` and `Release|x64` are supported deliverables. x64 exists because the NLC codec (see below) needs more headroom than x86 comfortably gives on slower CPUs; x86 remains buildable and is what most of the capture-side validation below was originally run against.
 
 ## Current streaming behavior
 
@@ -33,7 +33,23 @@ The supported build is `Release|x86`. The x64 project configuration is not a sup
 - Interlaced field buffers select full output row `row * 2 + !(field & 1)`, preserving the Groovy_MiSTer protocol's field/display parity. Filtering is computed for the logical full-height output before the requested field rows are selected.
 - Tables and scratch vectors are `thread_local` and retain capacity after warm-up. The filters add transform work but do not queue or buffer an additional frame.
 
-The legacy native `SetSource` export remains ABI-compatible and selects Point. GUI and CLI callers use `SetSourceEx`, which adds the sampling value. `SetCaptureWindow` accepts a pointer-sized HWND and keeps both source exports ABI-compatible. GUI save files are version 4; versions 1 and 2 load with Point sampling, and versions 1-3 load in display mode.
+The legacy native `SetSource` export remains ABI-compatible and selects Point. GUI and CLI callers use `SetSourceEx`, which adds the sampling value. `SetCaptureWindow` accepts a pointer-sized HWND and keeps both source exports ABI-compatible. GUI save files are version 5. Version 1 (the format both pre-merge forks shared) loads fully. Versions 2-4 are pre-merge, single-fork formats that used the same version numbers for mutually incompatible field layouts past the version-1 prefix (fjsj inserted the progressive-framebuffer field before the capture block; verbst appended codec/RGB/MTU fields after it) — the loader restores the modeline from these but stops there rather than guess-parse the divergent tail; see `MainWindow.xaml.cs`.
+
+### NLC codec, auto-reconnect, and controller v2 (from verbst/Groovy_MiSTer)
+
+- `Codec` defaults to `CodecLZ4` (works on any stock Groovy_MiSTer core). `CodecNLC` is opt-in from the Stream Options panel / `SetStreamOptions`, and only works against verbst's NLC-capable core build.
+- NLC encoding lives in `nlc_codec.cpp/h` (vendored, protocol-frozen: it must match the FPGA decoder bit-for-bit). `GroovyMister::EncodeNLC`/`buildNlcParams` drive it from `m_rgbMode`/`m_nlcPack`/`m_nearLevel`/`m_nlcWidth`. There is a pre-encode fast path (`getPBufferPreEncoded`/`setPreEncodedSize`) for callers whose CPU can't keep up with per-blit software encoding at the frame rate.
+- `setAutoReconnect(1)` arms a watchdog in `CmdBlit`: after 10 blits with no `frameEcho` advance it tears down the video side only (the inputs socket and its local port survive), rebuilds the session, and replays the last `CmdSwitchres` modeline. `reconnectEpoch()` increments on each successful reconnect; `renderer_nogpu::draw()` watches it to realign its own frame counter, since `resetSessionState()` zeroes the core's counters on every `CmdInit` but the host's counter would otherwise keep climbing from its old value.
+- Input capability negotiation (`GM_CAP_INPUTS_V2`, `GM_CAP_RUMBLE`) probes the core with `CMD_GET_VERSION` before sending a longer `CMD_INIT`, because a core older than `GROOVY_VERSION` 2 silently discards a `CMD_INIT` longer than 5 bytes (no ACK at all) instead of rejecting the extra byte gracefully.
+- RIO completion-path telemetry (`m_rioSendPosted/Failed/Drained`, `m_rioRecvRepostFailed`, `m_rioAckTimeout`) exists because an undrained send completion queue was field-diagnosed as the root cause of an audio-load stall that looked like a dead connection. Watch these alongside `dropped_video`/`dropped_audio` when debugging a stall.
+- Opt-in raw-frame dump (`setFrameDump`, or env `GM_FRAME_DUMP`) captures pre-compression frames for building an NLC test corpus.
+
+### Bugs found while merging the two forks' transport rewrites
+
+`groovymister.cpp`/`.h` were independently rewritten by both forks (fjsj for non-blocking multi-slot RIO sends, verbst for the NLC protocol and reconnect state machine) and had to be hand-merged. Two real bugs surfaced in verbst's version during that merge and were fixed rather than carried forward:
+
+- The ACK receive RIO buffer was registered at 17 bytes (`RIORegisterBuffer(m_bufferReceive, 17)`) against a 13-byte `m_bufferReceive` array — an out-of-bounds write on any receive that filled the registered length. The wire status packet is 13 bytes (`mistercast::protocol::FpgaStatusSize`); the registration now matches `sizeof(m_bufferReceive)`.
+- `DiffTime()` computed `m_tickEnd.QuadPart - m_tickStart.QuadPart` and treated the result as already being in 100ns units, which is only true if `QueryPerformanceFrequency()` happens to return exactly 10 MHz. It now scales by the measured frequency (`mistercast::CounterTicksTo100ns`), matching fjsj's original implementation.
 
 ### Interlace phase and framebuffer modes
 
@@ -112,7 +128,7 @@ No particular newer SDK build is required. MTU validation links `Iphlpapi.lib`, 
 
 Single-window capture uses the Windows SDK C++/WinRT headers and `WindowsApp.lib`, requires C++17, and has no additional redistributable dependency. The runtime feature requires Windows 10 version 1903 or newer.
 
-Download LZ4 1.9.4 from https://github.com/lz4/lz4/releases/download/v1.9.4/lz4_win32_v1_9_4.zip and extract it to `External/lz4`. The Win32 projects link `External/lz4/dll/liblz4.dll.a`; post-build steps copy `msys-lz4-1.dll` beside the GUI and CLI.
+LZ4 is vendored source (not a prebuilt DLL) in `Library/MiSTerCastLib/lz4/` and compiles directly into `MISTERCASTLIB.dll` — there is nothing to download and no `msys-lz4-1.dll` to copy. `MiSTerCast.csproj`'s post-build step only copies `MISTERCASTLIB.dll`/`.pdb` from the matching `x86`/`x64` output directory.
 
 ## Build and deterministic tests
 
@@ -185,6 +201,10 @@ Reference direct-Ethernet results from the current implementation:
 - Phase-recovery stress: three 720x480i/640x480i cycles with every 17th blit skipped and every 29th stalled for 40 ms produced 81 skips and 48 stalls with no RIO drops or transport errors.
 - Progressive interlace framebuffer: 720x480i/640x480i held about 59.9-60.3 updates/s with no drops or errors.
 - Line Blend: two 1920x1080-to-480i cycles with live 720-to-640 switches held 59.92-60.32 fields/s; maximum transform time was 3.72 ms with no drops or transport errors.
+
+## Known gap: MiSTerCastCli does not expose stream options yet
+
+`Tools/MiSTerCastCli/Program.cs` is unchanged from fjsj's original and only drives the capture/sampling/modeline surface (`SetSourceEx`, `SetModelineEx`, the fault-injection flags). It never calls `SetStreamOptions`, so a CLI-run session always uses whatever `stream_config` defaults `MiSTerCastLib.cpp::Initialize` set (LZ4, RGB888, MTU 1500, auto-reconnect on) and cannot be pointed at the NLC codec or a different RGB mode/MTU. Add `--codec`/`--rgb-mode`/`--mtu`/`--nlc-pack`/`--near-level`/`--auto-reconnect` flags calling `SetStreamOptions` before extending the hardware test matrix below to cover NLC.
 
 ## Documentation and commit discipline
 
