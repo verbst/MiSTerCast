@@ -21,6 +21,7 @@ Both `Release|x86` and `Release|x64` are supported deliverables. x64 exists beca
 - Capture loss keeps the worker alive and reinitializes Desktop Duplication instead of terminating the GUI.
 - The render worker always transforms the newest complete capture. Static desktops may produce a low `capture=` rate because Desktop Duplication reports only changes; `rate=` is the relevant output cadence.
 - Output buffers are owned by the Groovy_MiSTer transport. A field is not overwritten while an outstanding RIO send still references it.
+- For any non-delta codec (raw, plain LZ4, LZ4HC, NLC), `CmdBlit`'s compressed output buffer selection (`buffer_blit`) follows `field`, so the two fields pipeline across `m_pBufferLZ4[0]`/`[1]` instead of both serializing through slot 0. `CanWriteBlitBuffer` matches: it only requires *both* slots idle for the even-valued LZ4+delta codecs (the only ones where a payload can land in slot 1 regardless of field), and checks just `field`'s slot otherwise. Before this fix, every non-delta codec always targeted slot 0, so a session had no real double-buffering at all - field-tested on plain LZ4 and NLC, both accumulated `dropped_video` continuously (hundreds of drops per minute at 60fps/256x240) purely from this serialization, with no actual network or transport problem.
 
 ### Sampling modes
 

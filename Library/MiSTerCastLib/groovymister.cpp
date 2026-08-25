@@ -408,8 +408,18 @@ bool GroovyMister::CanWriteBlitBuffer(uint8_t field)
 			++m_droppedVideoBatches;
 			return false;
 		}
+		// Only the even-valued LZ4+delta codecs can land a payload in slot 1
+		// regardless of which field this is (CmdBlit's delta output always
+		// targets m_pBufferLZ4[1], win or lose, and that decision isn't known
+		// until after compression runs) - conservatively require both slots
+		// idle for those. Every other codec (raw, plain LZ4, LZ4HC, NLC)
+		// always sends this field's compressed output into m_pBufferLZ4[field],
+		// so checking just that slot is both correct and lets the two fields
+		// pipeline across the two registered buffers instead of serializing
+		// through one.
+		const bool deltaCapable = m_lz4Frames != 0 && (m_lz4Frames % 2) == 0;
 		bool available = false;
-		if (m_lz4Frames)
+		if (m_lz4Frames && deltaCapable)
 			available = m_outstandingBlitSends[0] == 0 && m_outstandingBlitSends[1] == 0;
 		else
 			available = m_outstandingBlitSends[field] == 0;
@@ -1515,7 +1525,21 @@ void GroovyMister::CmdBlit(uint32_t frame, uint8_t field, uint16_t vCountSync, u
 	}
 
 	setTimeStart();
-	uint8_t buffer_blit = (cSize > 0) ? (ratio_delta < 0.95) ? 1 : 0 : field;
+	// Buffer selection: a genuine delta payload (ratio_delta < 0.95, only
+	// possible for the even-valued LZ4+delta codecs) always targets slot 1,
+	// matching how that path has always compressed into m_pBufferLZ4[1]. For
+	// every other case - which is 100% of frames for a non-delta codec (LZ4,
+	// LZ4HC, NLC) and any frame where delta wasn't chosen for an even codec -
+	// this used to hardcode slot 0, so every single frame serialized through
+	// one physical buffer with no double-buffering at all: the next frame's
+	// blit could not start compressing/sending until CanWriteBlitBuffer saw
+	// that slot's prior RIO sends fully drain, and any frame that didn't
+	// clear in time was dropped rather than reused. Following `field` here
+	// instead - exactly like the uncompressed path already does - lets
+	// consecutive frames pipeline across both registered slots. Field-tested
+	// on plain LZ4 and NLC (both previously accumulated dropped_video
+	// continuously, e.g. ~500 drops over 80s at 60fps/256x240).
+	uint8_t buffer_blit = (cSize > 0 && ratio_delta < 0.95) ? 1 : field;
 	if (!SendStream(0, buffer_blit, bytesToSend, (ratio_delta < 0.95) ? cSizeDelta : cSize))
 	{
 		++m_droppedVideoBatches;
