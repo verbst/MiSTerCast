@@ -241,8 +241,9 @@ class GroovyMister
 	// GM_CAP_* actually negotiated for the live session (0 on a v1 session or
 	// after the CMD_GET_VERSION probe dropped the caps byte)
 	uint8_t getInputCaps(void);
-	// Opt-in ACK watchdog (default OFF): after 10 blits with no frameEcho
-	// advance, CmdBlit transparently reconnects — video side only, the inputs
+	// Opt-in ACK watchdog (default OFF): after WATCHDOG_RECONNECT_MS (1.5s)
+	// with no frameEcho advance, CmdBlit transparently reconnects — video
+	// side only, the inputs
 	// socket and its local port survive — and replays the stashed modeline.
 	// CmdInit re-zeroes fpga.* + m_frame on every (re)connect, so a stale
 	// session's counter can never leak into the raster servo, and DiffTimeRaster
@@ -385,7 +386,9 @@ class GroovyMister
 	uint16_t m_initVTotal;
 	uint8_t  m_initInterlace;
 	uint32_t m_lastFrameEchoSeen;
-	uint32_t m_noAckBlitCount;
+	uint64_t m_lastFrameEchoAdvanceMs; // monotonicMs() at the last frameEcho advance; the watchdog's stall clock
+	bool     m_noAckWarned;            // one-shot guard so the stall warning logs once per stall, not every blit
+	uint32_t m_noAckBlitCount;         // diagnostic only now (see WATCHDOG_*_MS): consecutive blits since the last advance
 	uint64_t m_lastReconnectAttemptMs;
 	uint32_t m_reconnectEpoch;
 

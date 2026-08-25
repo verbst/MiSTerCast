@@ -118,6 +118,20 @@ typedef union
 // host's field-validated GROOVY_RASTER_MAX_SPREAD.
 #define RASTER_MAX_FRAME_SPREAD 8
 
+// Auto-reconnect watchdog stall clock, in wall-clock time rather than a raw
+// consecutive-blit count (a count-based gate is a moving target across
+// resolutions/codecs/frame rates). Field-observed on a real core: a session
+// can go 300-800ms with zero frameEcho advance and then catch up in a burst
+// while perfectly healthy - a live NLC session with nothing else on the wire
+// besides video showed this stall pattern (and would previously reconnect
+// on it every ~1-2s) purely from how that core's ACK cadence behaved,
+// disconnected from any actual network or transport failure. These
+// thresholds sit comfortably above the observed worst-case burst gap so
+// that pattern is absorbed instead of triggering a disruptive reconnect,
+// while still recovering from a genuine dead link within about 1.5s.
+#define WATCHDOG_WARN_MS 500
+#define WATCHDOG_RECONNECT_MS 1500
+
 GroovyMister::GroovyMister()
 {
 	m_verbose = 0;
@@ -213,6 +227,8 @@ GroovyMister::GroovyMister()
 	m_initVTotal = 0;
 	m_initInterlace = 0;
 	m_lastFrameEchoSeen = 0;
+	m_lastFrameEchoAdvanceMs = 0;
+	m_noAckWarned = false;
 	m_noAckBlitCount = 0;
 	m_lastReconnectAttemptMs = 0;
 	m_reconnectEpoch = 0;
@@ -1129,6 +1145,8 @@ int GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, int lz4Fr
 		m_initRgbMode = rgbMode;
 		m_initMtu = mtu;
 		m_lastFrameEchoSeen = 0;
+		m_lastFrameEchoAdvanceMs = monotonicMs();
+		m_noAckWarned = false;
 		m_noAckBlitCount = 0;
 		LOG(0,"[MiSTer] Connected: core ver %d, CMD_INIT byte1=0x%02x caps=0x%02x\n", m_core_version, (uint8_t) m_bufferSend[1], m_negotiatedCaps);
 		return 0;
@@ -1221,42 +1239,54 @@ void GroovyMister::CmdBlit(uint32_t frame, uint8_t field, uint16_t vCountSync, u
 		// stays armed: fall through so the rate-limited retry below can run
 		// (otherwise "retry in 1s" could never fire — this early-out would
 		// block it forever)
-		if (!(m_autoReconnect && m_noAckBlitCount >= 10 && m_initHost[0] != '\0'))
+		if (!(m_autoReconnect && m_initHost[0] != '\0'))
 		{
 			return;
 		}
 	}
 
 	// Opt-in ACK watchdog (setAutoReconnect): fpga.frameEcho is refreshed by
-	// getACK() from WaitSync/DiffTimeRaster; if it stops advancing across
-	// blits the core has gone silent. Warn at 5 misses, reconnect at 10
-	// (~167ms at 60Hz), rate-limited to one attempt per second. The reconnect
-	// tears down ONLY the video side — the inputs socket and its local port
-	// survive, so the subscribe re-sent around the inner CmdInit restores the
-	// pad stream (the pre-init send lands in the core's one-shot CMD_INIT
-	// read; the post-init send is UDP-loss insurance for address-aware cores).
+	// getACK() from WaitSync/DiffTimeRaster; if it stops advancing for too
+	// long the core has gone silent. Gated on elapsed wall-clock time rather
+	// than a raw consecutive-blit count: a live core can legitimately go
+	// several hundred milliseconds with zero frameEcho advance and then
+	// catch up in a burst while otherwise perfectly healthy (field-observed
+	// on NLC with nothing else on the wire besides video - the burst pattern
+	// tracked some core-side behavior unrelated to any actual network or
+	// transport failure), and a count-based gate at 60fps left far less
+	// margin for that than intended. Warn at WATCHDOG_WARN_MS, reconnect at
+	// WATCHDOG_RECONNECT_MS, rate-limited to one attempt per second. The
+	// reconnect tears down ONLY the video side — the inputs socket and its
+	// local port survive, so the subscribe re-sent around the inner CmdInit
+	// restores the pad stream (the pre-init send lands in the core's
+	// one-shot CMD_INIT read; the post-init send is UDP-loss insurance for
+	// address-aware cores).
 	if (m_autoReconnect)
 	{
 		if (fpga.frameEcho > m_lastFrameEchoSeen)
 		{
 			m_lastFrameEchoSeen = fpga.frameEcho;
+			m_lastFrameEchoAdvanceMs = monotonicMs();
+			m_noAckWarned = false;
 			m_noAckBlitCount = 0;
 		}
 		else if (m_frame > 0)
 		{
 			m_noAckBlitCount++;
-			if (m_noAckBlitCount == 5)
+			const uint64_t nowMs = monotonicMs();
+			const uint64_t stalledMs = nowMs - m_lastFrameEchoAdvanceMs;
+			if (!m_noAckWarned && stalledMs >= WATCHDOG_WARN_MS)
 			{
-				LOG(0,"[MiSTer] WARNING: no ACK advance for 5 blits (lastEcho=%u, sending=%u)\n", fpga.frameEcho, frame);
+				m_noAckWarned = true;
+				LOG(0,"[MiSTer] WARNING: no ACK advance for %llu ms (lastEcho=%u, sending=%u)\n",
+					(unsigned long long)stalledMs, fpga.frameEcho, frame);
 			}
-			if (m_noAckBlitCount >= 10 && m_initHost[0] != '\0')
+			if (stalledMs >= WATCHDOG_RECONNECT_MS && m_initHost[0] != '\0')
 			{
-				uint64_t nowMs = monotonicMs();
 				if (m_lastReconnectAttemptMs != 0 && (nowMs - m_lastReconnectAttemptMs) < 1000)
 				{
 					// inside the back-off window; stay primed to retry the
-					// moment it elapses instead of needing 10 fresh misses
-					m_noAckBlitCount = 10;
+					// moment it elapses instead of needing a fresh stall
 					return;
 				}
 				m_lastReconnectAttemptMs = nowMs;
@@ -1265,7 +1295,8 @@ void GroovyMister::CmdBlit(uint32_t frame, uint8_t field, uint16_t vCountSync, u
 				char savedHost[sizeof(m_initHost)];
 				memcpy(savedHost, m_initHost, sizeof(savedHost));
 
-				LOG(0,"[MiSTer] No ACK advance for %u blits: reconnecting to %s:%u\n", m_noAckBlitCount, savedHost, m_initPort);
+				LOG(0,"[MiSTer] No ACK advance for %llu ms: reconnecting to %s:%u\n",
+					(unsigned long long)stalledMs, savedHost, m_initPort);
 				CmdSendClose();  // plain sendto: delivers even if the RIO queues are wedged
 				m_isConnected = 0;
 				teardownVideo(); // inputs socket deliberately untouched
@@ -1291,8 +1322,10 @@ void GroovyMister::CmdBlit(uint32_t frame, uint8_t field, uint16_t vCountSync, u
 				}
 				else
 				{
+					// m_lastFrameEchoAdvanceMs is untouched, so stalledMs keeps
+					// growing past WATCHDOG_RECONNECT_MS on its own; the next
+					// call retries as soon as the 1s back-off above elapses.
 					LOG(0,"[MiSTer] Reconnect failed (rc=%d); retrying in 1s\n", rc);
-					m_noAckBlitCount = 10;
 				}
 				// either way this blit is skipped: the send buffers/queues
 				// were just rebuilt (or are down)
