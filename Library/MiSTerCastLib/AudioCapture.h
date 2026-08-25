@@ -1,23 +1,15 @@
 #pragma once
 
+#include "AudioProcessing.h"
+
 // REFERENCE_TIME time units per second and per millisecond
 #define REFTIMES_PER_SEC  10000000
 #define REFTIMES_PER_MILLISEC  10000
 
-// Buffers
-//
-// CmdAudio takes its byte count in a uint16, so one drain must stay well under
-// 65535: a larger backlog truncates, and an exact multiple of 65536 puts an
-// empty CMD_AUDIO on the wire that the core rejects with UDP_ERROR. That is not
-// hypothetical - the WASAPI loopback buffer below is a full second deep, so any
-// stall (notably the gap between the stream starting and the first video frame)
-// builds one. 16 KB is ~85 ms at 48 kHz stereo; steady state is ~3.2 KB/frame.
-#define AUDIO_MAX_BYTES   16384
-#define AUDIO_MAX_SAMPLES (AUDIO_MAX_BYTES / 2)  // int16 samples, 4096 stereo frames
-
-unsigned int AudioWritePos = 0;                  // in int16 samples, always even
 std::atomic_int audioSampleRate;
 int16_t* audioBuffer = nullptr;                  // points at the client's registered audio buffer
+std::vector<int16_t> audioCaptureScratch;
+unsigned int AudioWritePos = 0;                  // in int16 samples, always even
 
 // Audio Capture
 REFERENCE_TIME hnsRequestedDuration = REFTIMES_PER_SEC;
@@ -28,6 +20,7 @@ IMMDevice *pDevice = NULL;
 IAudioClient *pAudioClient = NULL;
 IAudioCaptureClient *pCaptureClient = NULL;
 WAVEFORMATEX *pwfx = NULL;
+bool audioCaptureComInitialized = false;
 bool audioFormatUsable = false;
 
 bool InitAudioCapture()
@@ -36,6 +29,7 @@ bool InitAudioCapture()
 
     hr = CoInitialize(nullptr);
     EXIT_ON_ERROR(hr, "CoInitialize failed");
+    audioCaptureComInitialized = true;
 
     hr = CoCreateInstance(
         __uuidof(MMDeviceEnumerator), NULL,
@@ -52,17 +46,29 @@ bool InitAudioCapture()
     EXIT_ON_ERROR(hr, "IMMDevice Activate failed");
 
     hr = pAudioClient->GetMixFormat(&pwfx);
-    audioSampleRate = pwfx->nSamplesPerSec;
     EXIT_ON_ERROR(hr, "IAudioClient GetMixFormat failed");
+    audioSampleRate = pwfx->nSamplesPerSec;
 
-    // The shared-mode mix format is 32-bit float in every shipping configuration
-    // of WASAPI, and the capture path below reads it as such. Refuse rather than
-    // reinterpret if that ever stops being true.
-    audioFormatUsable = (pwfx->wBitsPerSample == 32 && pwfx->nChannels >= 1);
+    // The shared-mode mix format is almost always 32-bit IEEE float, but some
+    // endpoints expose other bit depths, and WAVE_FORMAT_EXTENSIBLE can carry
+    // a non-float subformat at 32 bits. Verify the actual tag/subformat GUID
+    // instead of assuming float-at-32-bit: reinterpreting non-float PCM as
+    // float produces loud garbage, not just wrong volume.
+    bool floatFormat = pwfx->wFormatTag == WAVE_FORMAT_IEEE_FLOAT;
+    if (pwfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE && pwfx->cbSize >= 22)
+    {
+        const WAVEFORMATEXTENSIBLE* extensible = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(pwfx);
+        floatFormat = IsEqualGUID(extensible->SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
+    }
+    audioFormatUsable = floatFormat && pwfx->wBitsPerSample == 32 && pwfx->nChannels != 0 &&
+        pwfx->nBlockAlign >= pwfx->nChannels * sizeof(float);
     if (!audioFormatUsable)
     {
-        LogMessage("Windows is mixing at " + std::to_string(pwfx->wBitsPerSample) +
-            " bits per sample, which MiSTerCast cannot convert. Audio is disabled.", true);
+        // Degrade gracefully: keep the video stream going without audio
+        // rather than aborting the whole capture session over a mix format
+        // MiSTerCast cannot convert.
+        LogMessage("The default audio endpoint does not expose 32-bit floating-point loopback audio. "
+            "Streaming will continue without audio.", true);
     }
     else if (pwfx->nChannels > 2)
     {
@@ -88,13 +94,22 @@ bool InitAudioCapture()
     return true;
 }
 
-void CleanupAudioCatpure()
+void CleanupAudioCapture()
 {
     CoTaskMemFree(pwfx);
-    SAFE_RELEASE(pEnumerator)
-    SAFE_RELEASE(pDevice)
-    SAFE_RELEASE(pAudioClient)
+    pwfx = nullptr;
     SAFE_RELEASE(pCaptureClient)
+    SAFE_RELEASE(pAudioClient)
+    SAFE_RELEASE(pDevice)
+    SAFE_RELEASE(pEnumerator)
+    audioBuffer = nullptr;
+    audioSampleRate = 0;
+    audioFormatUsable = false;
+    if (audioCaptureComInitialized)
+    {
+        CoUninitialize();
+        audioCaptureComInitialized = false;
+    }
 }
 
 bool StartAudioCapture()
@@ -114,21 +129,13 @@ bool StopAudioCapture()
      return true;
 }
 
-// Float sample to signed 16-bit LE. The clamp matters: mixers with DC filters
-// and volume scaling overshoot +-1.0, and an unclamped sample wraps into an
-// audible click rather than clipping.
-inline int16_t AudioSampleToS16(float sample)
+// writeOutput is false while the transport's audio buffer is still owned by
+// an outstanding non-blocking send (GroovyMister::CanWriteAudioBuffer()); the
+// endpoint is still drained so it cannot back up, the samples are just
+// discarded for that tick.
+bool TickAudioCapture(bool writeOutput = true)
 {
-    if (sample > 1.0f)
-        sample = 1.0f;
-    else if (sample < -1.0f)
-        sample = -1.0f;
-
-    return (int16_t)(sample * 32767.0f);
-}
-
-bool TickAudioCapture()
-{
+    audioCaptureScratch.clear();
     AudioWritePos = 0;
     UINT32 packetLength = 0;
     HRESULT hr = pCaptureClient->GetNextPacketSize(&packetLength);
@@ -147,53 +154,46 @@ bool TickAudioCapture()
             &flags, NULL, NULL);
         EXIT_ON_ERROR(hr, "IAudioCaptureClient GetBuffer failed");
 
-        // Keep draining even when there is nowhere to put it, otherwise the
-        // endpoint buffer backs up and every later packet is discontinuous.
-        if (audioBuffer && audioFormatUsable)
+        // Keep draining even when the format is unusable or there is nowhere
+        // to put it, otherwise the endpoint buffer backs up and every later
+        // packet is discontinuous.
+        if (audioFormatUsable)
         {
             const bool silence = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
-            const float* pDataFloat = (const float*)pData;
-            const unsigned int capFrames = AUDIO_MAX_SAMPLES / 2;
-
-            // Shed the oldest audio so latency self-corrects after a stall
-            // instead of accumulating. Done in whole stereo frames, and at most
-            // one move per packet - trimming a frame at a time would be
-            // quadratic on the backlog this exists to handle.
-            UINT32 firstFrame = 0;
-            if (numFramesAvailable > capFrames)
+            // WASAPI is polled once per rendered frame, so forward the accumulated
+            // samples immediately so loopback capture does not add a prebuffer.
+            // If rendering stalled long enough to exceed the protocol's 16-bit byte
+            // count, retain the newest audio so latency cannot grow without bound.
+            const size_t framesToKeep = std::min<size_t>(numFramesAvailable, mistercast::MaxAudioValuesPerCommand / 2);
+            const size_t stereoValues = framesToKeep * 2;
+            if (audioCaptureScratch.size() + stereoValues > mistercast::MaxAudioValuesPerCommand)
             {
-                // This packet alone overflows; everything older is superseded.
-                firstFrame = numFramesAvailable - capFrames;
-                AudioWritePos = 0;
+                const size_t excess = audioCaptureScratch.size() + stereoValues - mistercast::MaxAudioValuesPerCommand;
+                std::move(audioCaptureScratch.begin() + excess, audioCaptureScratch.end(), audioCaptureScratch.begin());
+                audioCaptureScratch.resize(audioCaptureScratch.size() - excess);
             }
 
-            const UINT32 framesToWrite = numFramesAvailable - firstFrame;
-            const unsigned int heldFrames = AudioWritePos / 2;
-            if (heldFrames + framesToWrite > capFrames)
+            const size_t writeOffset = audioCaptureScratch.size();
+            audioCaptureScratch.resize(writeOffset + stereoValues);
+            if (silence)
             {
-                const unsigned int dropFrames = heldFrames + framesToWrite - capFrames;
-                const unsigned int keepSamples = AudioWritePos - dropFrames * 2;
-                memmove(audioBuffer, audioBuffer + dropFrames * 2, keepSamples * sizeof(int16_t));
-                AudioWritePos = keepSamples;
+                std::fill(audioCaptureScratch.begin() + writeOffset, audioCaptureScratch.end(), 0);
             }
-
-            for (UINT32 frame = firstFrame; frame < numFramesAvailable; frame++)
+            else
             {
-                if (silence)
+                const float* samples = reinterpret_cast<const float*>(pData) +
+                    static_cast<size_t>(numFramesAvailable - framesToKeep) * channels;
+                if (!mistercast::ConvertFloatFramesToStereo(
+                    samples,
+                    framesToKeep,
+                    static_cast<uint16_t>(channels),
+                    audioCaptureScratch.data() + writeOffset,
+                    stereoValues))
                 {
-                    audioBuffer[AudioWritePos] = 0;
-                    audioBuffer[AudioWritePos + 1] = 0;
+                    pCaptureClient->ReleaseBuffer(numFramesAvailable);
+                    LogMessage("Unable to convert captured audio to stereo PCM.", true);
+                    return false;
                 }
-                else
-                {
-                    const float* srcFrame = pDataFloat + (size_t)frame * channels;
-                    const int16_t left = AudioSampleToS16(srcFrame[0]);
-                    const int16_t right = (channels >= 2) ? AudioSampleToS16(srcFrame[1]) : left;
-                    audioBuffer[AudioWritePos] = left;
-                    audioBuffer[AudioWritePos + 1] = right;
-                }
-
-                AudioWritePos += 2;
             }
         }
 
@@ -202,6 +202,12 @@ bool TickAudioCapture()
 
         hr = pCaptureClient->GetNextPacketSize(&packetLength);
         EXIT_ON_ERROR(hr, "IAudioCaptureClient GetNextPacketSize failed");
+    }
+
+    if (writeOutput && audioBuffer != nullptr && !audioCaptureScratch.empty())
+    {
+        AudioWritePos = static_cast<unsigned int>(audioCaptureScratch.size());
+        std::memcpy(audioBuffer, audioCaptureScratch.data(), AudioWritePos * sizeof(int16_t));
     }
 
     return true;

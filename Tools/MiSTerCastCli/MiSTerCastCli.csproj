@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" Condition="false" />
+  <PropertyGroup>
+    <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
+    <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
+    <ProjectGuid>{8B7F43E7-D7AE-4A16-BEDB-67F6240D6442}</ProjectGuid>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>MiSTerCast</RootNamespace>
+    <AssemblyName>MiSTerCastCli</AssemblyName>
+    <TargetFrameworkVersion>v4.7.2</TargetFrameworkVersion>
+    <FileAlignment>512</FileAlignment>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
+    <PlatformTarget>x86</PlatformTarget>
+    <DebugSymbols>true</DebugSymbols>
+    <DebugType>full</DebugType>
+    <Optimize>false</Optimize>
+    <OutputPath>..\..\FrontEnd\bin\Debug\</OutputPath>
+    <DefineConstants>DEBUG;TRACE</DefineConstants>
+    <WarningLevel>4</WarningLevel>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
+    <PlatformTarget>x86</PlatformTarget>
+    <DebugType>pdbonly</DebugType>
+    <Optimize>true</Optimize>
+    <OutputPath>..\..\FrontEnd\bin\Release\</OutputPath>
+    <DefineConstants>TRACE</DefineConstants>
+    <WarningLevel>4</WarningLevel>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="System" />
+    <Reference Include="System.Core" />
+    <Reference Include="System.Drawing" />
+    <Reference Include="System.Windows.Forms" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="..\..\FrontEnd\MiSTerCastInterop.cs">
+      <Link>MiSTerCastInterop.cs</Link>
+    </Compile>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="..\..\FrontEnd\modelines.dat">
+      <Link>modelines.dat</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+  <PropertyGroup>
+    <PostBuildEvent>xcopy "$(MSBuildProjectDirectory)\..\..\External\lz4\dll\msys-lz4-1.dll" "$(TargetDir)msys-lz4-1.dll*" /y
+if $(ConfigurationName) == Release xcopy "$(MSBuildProjectDirectory)\..\..\FrontEnd\Release\MISTERCASTLIB.dll" "$(TargetDir)MISTERCASTLIB.dll*" /y
+if $(ConfigurationName) == Debug xcopy "$(MSBuildProjectDirectory)\..\..\FrontEnd\Debug\MISTERCASTLIB.dll" "$(TargetDir)MISTERCASTLIB.dll*" /y</PostBuildEvent>
+  </PropertyGroup>
+</Project>
