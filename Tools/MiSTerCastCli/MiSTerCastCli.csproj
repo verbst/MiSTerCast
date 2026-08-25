@@ -13,7 +13,7 @@
     <Deterministic>true</Deterministic>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
-    <PlatformTarget>x86</PlatformTarget>
+    <PlatformTarget>x64</PlatformTarget>
     <DebugSymbols>true</DebugSymbols>
     <DebugType>full</DebugType>
     <Optimize>false</Optimize>
@@ -22,7 +22,7 @@
     <WarningLevel>4</WarningLevel>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
-    <PlatformTarget>x86</PlatformTarget>
+    <PlatformTarget>x64</PlatformTarget>
     <DebugType>pdbonly</DebugType>
     <Optimize>true</Optimize>
     <OutputPath>..\..\FrontEnd\bin\Release\</OutputPath>
@@ -48,11 +48,11 @@
     </None>
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
-  <!-- MiSTerCastLib.vcxproj writes to <SolutionDir>x86\<Configuration>\ (SolutionDir
-       is FrontEnd\, the directory of MiSTerCast.sln); this CLI is always x86
+  <!-- MiSTerCastLib.vcxproj writes to <SolutionDir>x64\<Configuration>\ (SolutionDir
+       is FrontEnd\, the directory of MiSTerCast.sln); this CLI is always x64
        (PlatformTarget above), so that is the one output folder to copy from. LZ4
        is compiled into MISTERCASTLIB.dll now, so there is no separate DLL to copy. -->
   <PropertyGroup>
-    <PostBuildEvent>xcopy "$(MSBuildProjectDirectory)\..\..\FrontEnd\x86\$(ConfigurationName)\MISTERCASTLIB.dll" "$(TargetDir)MISTERCASTLIB.dll*" /y</PostBuildEvent>
+    <PostBuildEvent>xcopy "$(MSBuildProjectDirectory)\..\..\FrontEnd\x64\$(ConfigurationName)\MISTERCASTLIB.dll" "$(TargetDir)MISTERCASTLIB.dll*" /y</PostBuildEvent>
   </PropertyGroup>
 </Project>
