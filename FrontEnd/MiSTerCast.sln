@@ -1,4 +1,4 @@
-﻿
+
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio 15
 VisualStudioVersion = 15.0.28307.1705
@@ -9,6 +9,13 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MiSTerCast", "MiSTerCast.cs
 	EndProjectSection
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "MiSTerCastLib", "..\Library\MiSTerCastLib\MiSTerCastLib.vcxproj", "{3F2B9AA9-BCC6-475B-8B39-3562BFE8CEB7}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "MiSTerCastTests", "..\Tests\MiSTerCastTests.vcxproj", "{1A9EFA5B-6237-4B36-A8D9-56AB0F4C1682}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MiSTerCastCli", "..\Tools\MiSTerCastCli\MiSTerCastCli.csproj", "{8B7F43E7-D7AE-4A16-BEDB-67F6240D6442}"
+	ProjectSection(ProjectDependencies) = postProject
+		{3F2B9AA9-BCC6-475B-8B39-3562BFE8CEB7} = {3F2B9AA9-BCC6-475B-8B39-3562BFE8CEB7}
+	EndProjectSection
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -34,6 +41,22 @@ Global
 		{3F2B9AA9-BCC6-475B-8B39-3562BFE8CEB7}.Release|x64.Build.0 = Release|x64
 		{3F2B9AA9-BCC6-475B-8B39-3562BFE8CEB7}.Release|x86.ActiveCfg = Release|Win32
 		{3F2B9AA9-BCC6-475B-8B39-3562BFE8CEB7}.Release|x86.Build.0 = Release|Win32
+		{1A9EFA5B-6237-4B36-A8D9-56AB0F4C1682}.Debug|x64.ActiveCfg = Debug|x64
+		{1A9EFA5B-6237-4B36-A8D9-56AB0F4C1682}.Debug|x64.Build.0 = Debug|x64
+		{1A9EFA5B-6237-4B36-A8D9-56AB0F4C1682}.Debug|x86.ActiveCfg = Debug|Win32
+		{1A9EFA5B-6237-4B36-A8D9-56AB0F4C1682}.Debug|x86.Build.0 = Debug|Win32
+		{1A9EFA5B-6237-4B36-A8D9-56AB0F4C1682}.Release|x64.ActiveCfg = Release|x64
+		{1A9EFA5B-6237-4B36-A8D9-56AB0F4C1682}.Release|x64.Build.0 = Release|x64
+		{1A9EFA5B-6237-4B36-A8D9-56AB0F4C1682}.Release|x86.ActiveCfg = Release|Win32
+		{1A9EFA5B-6237-4B36-A8D9-56AB0F4C1682}.Release|x86.Build.0 = Release|Win32
+		{8B7F43E7-D7AE-4A16-BEDB-67F6240D6442}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{8B7F43E7-D7AE-4A16-BEDB-67F6240D6442}.Debug|x64.Build.0 = Debug|Any CPU
+		{8B7F43E7-D7AE-4A16-BEDB-67F6240D6442}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{8B7F43E7-D7AE-4A16-BEDB-67F6240D6442}.Debug|x86.Build.0 = Debug|Any CPU
+		{8B7F43E7-D7AE-4A16-BEDB-67F6240D6442}.Release|x64.ActiveCfg = Release|Any CPU
+		{8B7F43E7-D7AE-4A16-BEDB-67F6240D6442}.Release|x64.Build.0 = Release|Any CPU
+		{8B7F43E7-D7AE-4A16-BEDB-67F6240D6442}.Release|x86.ActiveCfg = Release|Any CPU
+		{8B7F43E7-D7AE-4A16-BEDB-67F6240D6442}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

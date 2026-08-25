@@ -2,6 +2,8 @@
 #define __GROOVYMISTER_H__
 
 #include <inttypes.h>
+#include <string>
+#include "InterlacePhase.h"
 
 #ifdef _WIN32
  #ifndef NOMINMAX
@@ -27,6 +29,11 @@
 #define BUFFER_SLICES 846
 #define MTU_HEADER 28
 #define BUFFER_MTU 1500 - MTU_HEADER
+
+#ifdef _WIN32
+#define RIO_COMMAND_SLOTS 64
+#define RIO_SEND_QUEUE_SIZE (BUFFER_SLICES * 2 + RIO_COMMAND_SLOTS)
+#endif
 
 //joystick map
 #define GM_JOY_RIGHT (1 << 0)
@@ -92,6 +99,32 @@ typedef struct fpgaStatus{
 	uint8_t vramQueue; 	//1-fpga has pixels prepared on vram
 } fpgaStatus;
 
+// Host-observability snapshot: transport health + protocol state in one call,
+// so a GUI/CLI host does not have to poke individual counters.
+typedef struct groovyMisterDiagnostics {
+	uint32_t commandFrame;
+	uint32_t frameTime;
+	uint32_t streamTime;
+	uint32_t emulationTime;
+	uint32_t outstandingSends;
+	uint32_t droppedVideoBatches;
+	uint32_t droppedAudioBatches;
+	uint32_t transportErrors;
+	uint32_t requestedPathMtu;
+	uint32_t routeInterfaceMtu;
+	uint32_t routeInterfaceIndex;
+	uint64_t rioSendPosted;
+	uint64_t rioSendFailed;
+	uint64_t rioSendDrained;
+	uint64_t rioRecvRepostFailed;
+	uint64_t rioAckTimeout;
+	uint32_t reconnectEpoch;
+	uint32_t noAckBlitCount;
+	uint8_t connected;
+	uint8_t haveFpgaStatus;
+	uint8_t interlacePhaseValid;
+} groovyMisterDiagnostics;
+
 typedef struct fpgaJoyInputs{
 	uint32_t joyFrame;	//joystick blit frame
 	uint8_t  joyOrder;	//joystick blit order
@@ -135,21 +168,26 @@ void gm_set_log_sink(gm_log_sink_fn fn);
 class GroovyMister
 {
  public:
-	 
+
 	fpgaStatus fpga; 	 // Data with last received ACK
 	fpgaJoyInputs joyInputs; // Data with last joystick inputs received
 	fpgaPS2Inputs ps2Inputs; // Data with last ps2 inputs received
 
 	GroovyMister();
 	~GroovyMister();
-	
+
 	char* getPBufferBlit(uint8_t field); // This buffer are registered and aligned for sending rgb. Populate it before CmdBlit
 	char* getPBufferPreEncoded(void); // Registered compressed-send buffer. For the NLC pre-encode fast path: write an EncodeNLC frame here, then setPreEncodedSize + CmdBlit
 	void setPreEncodedSize(uint32_t cSize); // One-shot: the next CmdBlit sends cSize pre-encoded bytes from getPBufferPreEncoded() and SKIPS the software encoder (NLC codec only)
 	uint32_t EncodeNLC(const char* rgbFrame, char* out); // Encode one frame with CmdBlit's exact NLC params (call after CmdSwitchres); returns encoded size (0 = failed)
 	char* getPBufferBlitDelta(void); // This buffer are registered and aligned for sending rgb. Populate it before CmdBlit with delta difference between actual frame and last
 	char* getPBufferAudio(void); // This buffer are registered and aligned for sending audio. Populate it before CmdAudio
-	
+	// Non-blocking availability: false while the transport still owns an
+	// outstanding RIO send referencing that buffer. Callers should skip the
+	// write (and, for video, drop the frame) rather than overwrite live data.
+	bool CanWriteBlitBuffer(uint8_t field);
+	bool CanWriteAudioBuffer(void);
+
 	// Close connection
 	void CmdClose(void);
 	// Init streaming with ip, port
@@ -165,6 +203,8 @@ class GroovyMister
 	void CmdBlit(uint32_t frame, uint8_t field, uint16_t vCountSync, uint32_t margin, uint32_t matchDeltaBytes);
 	// Stream audio
 	void CmdAudio(uint16_t soundSize);
+	// Align an outgoing frame and field to the latest authoritative FPGA phase.
+	void AlignFrame(uint32_t& frame, uint8_t& field);
 	// getACK is used internal on WaitSync, dwMilliseconds = 0 will time out immediately if no new data
 	uint32_t getACK(DWORD dwMilliseconds);
 	// sleep to sync with crt raster
@@ -217,6 +257,8 @@ class GroovyMister
 
 	void setVerbose(uint8_t sev);
 	const char* getVersion();
+	const std::string& getLastError() const noexcept;
+	groovyMisterDiagnostics getDiagnostics() const noexcept;
 	// Opt-in raw-frame dump for corpus capture (tools/nlc_bench): every CmdBlit's
 	// pre-compression buffer -> dir/frame_WxH_fmt_NNNNNN.raw until maxFrames.
 	// Also armed by env GM_FRAME_DUMP=<dir> (+ GM_FRAME_DUMP_MAX, default 120).
@@ -239,21 +281,33 @@ class GroovyMister
 	RIO_CQ m_receiveQueue;
 	RIO_RQ m_requestQueue;
 	HANDLE m_hIOCP;
+	OVERLAPPED m_receiveOverlapped;
 	RIO_BUFFERID m_sendRioBufferId;
-	RIO_BUF m_sendRioBuffer;
+	RIO_BUF m_sendRioBuffers[RIO_COMMAND_SLOTS];
+	char m_rioCommandBuffers[RIO_COMMAND_SLOTS][26];
+	bool m_commandSlotOutstanding[RIO_COMMAND_SLOTS];
 	RIO_BUFFERID m_receiveRioBufferId;
 	RIO_BUF m_receiveRioBuffer;
-	RIO_BUFFERID m_sendRioBufferBlitId[2];	
+	RIO_BUFFERID m_sendRioBufferBlitId[2];
 	RIO_BUF *m_pBufsBlit[2];
 	RIO_BUFFERID m_sendRioBufferAudioId;
 	RIO_BUF m_sendRioBufferAudio;
 	RIO_BUF *m_pBufsAudio;
 	SOCKET m_sockInputsFD;
+	bool m_wsaStarted;
+	bool m_rioFunctionsReady;
+	bool m_receiveNotificationArmed;
+	bool m_rioFailed;
+	ULONG m_outstandingRioSends;
+	ULONG m_outstandingRioReceives;
+	ULONG m_outstandingBlitSends[2];
+	ULONG m_outstandingAudioSends;
 
 	LARGE_INTEGER m_tickStart;
 	LARGE_INTEGER m_tickEnd;
 	LARGE_INTEGER m_tickSync;
 	LARGE_INTEGER m_tickCongestion;
+	uint64_t m_timerFrequency;
 #else
 	int m_sockFD;
 	int m_sockInputsFD;
@@ -296,6 +350,15 @@ class GroovyMister
 	uint32_t m_network_ping;
 	uint8_t m_delta_enabled[2];
 	uint8_t m_isConnected;
+	bool m_haveFpgaStatus;
+	mistercast::InterlacePhase m_interlacePhase;
+	uint32_t m_droppedVideoBatches;
+	uint32_t m_droppedAudioBatches;
+	uint32_t m_transportErrors;
+	uint32_t m_requestedPathMtu;
+	uint32_t m_routeInterfaceMtu;
+	uint32_t m_routeInterfaceIndex;
+	std::string m_lastError;
 	uint8_t m_negotiatedCaps;   // caps granted for the live session (version probe may drop m_inputCaps)
 	uint8_t m_videoTorndown;    // run-once guard for teardownVideo(); re-armed by CmdInit
 	uint8_t m_autoReconnect;    // opt-in CmdBlit ACK watchdog (default 0)
@@ -338,16 +401,24 @@ class GroovyMister
 
 	void teardownVideo(void);
 	void resetSessionState(void); // zero the per-session raster state (fpga.* + m_frame); constructor + every CmdInit
-	uint32_t drainSendCompletions(void);
 	uint8_t inputsBound(void);
 	uint64_t monotonicMs(void);
 	char *AllocateBufferSpace(const DWORD bufSize, const DWORD bufCount, DWORD& totalBufferSize, DWORD& totalBufferCount);
-	void Send(void *cmd, int cmdSize);
-	void SendStream(uint8_t whichBuffer, uint8_t field, uint32_t bytesToSend, uint32_t cSize);
+	bool Send(void *cmd, int cmdSize);
+	bool SendStream(uint8_t whichBuffer, uint8_t field, uint32_t bytesToSend, uint32_t cSize);
+#ifdef _WIN32
+	void DrainRioSendCompletions(void);
+	void DrainRioReceiveCompletions(void);
+	bool CanQueueRioSends(ULONG requestCount);
+	bool QueueRioReceive(void);
+	bool ArmRioReceiveNotification(void);
+	void RecordRioError(const char* operation);
+	void ReleaseRioSendContext(void* requestContext);
+#endif
 	void setTimeStart(void);
 	void setTimeEnd(void);
 	uint32_t DiffTime(void);
-	void setFpgaStatus(void);
+	bool setFpgaStatus(void);
 	void setFpgaJoystick(int len);
 	void setFpgaPS2(int len);
 };

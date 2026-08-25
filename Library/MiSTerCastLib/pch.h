@@ -15,6 +15,7 @@
 #include <windows.h>
 #include <winsock2.h>
 #include <Ws2tcpip.h>
+#include <iphlpapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <timeapi.h>
@@ -30,6 +31,7 @@
 #include <MMDeviceAPI.h>
 #include <AudioClient.h>
 #include <AudioPolicy.h>
+#include <ksmedia.h>
 #include <algorithm>
 
 #include <stdlib.h>
@@ -41,10 +43,18 @@
 
 #include <string>
 #include <functional>
+#include <mutex>
 #include <vector>
 #include <memory>
 
 #include <d3d11.h>
 #include <dxgi1_2.h>
+#include <windows.graphics.capture.interop.h>
+#include <windows.graphics.directx.direct3d11.interop.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Graphics.h>
+#include <winrt/Windows.Graphics.Capture.h>
+#include <winrt/Windows.Graphics.DirectX.h>
+#include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
 
 #endif //PCH_H

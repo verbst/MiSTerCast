@@ -1,3 +1,7 @@
+#pragma once
+
+#include "FrameTransform.h"
+
 #ifdef MISTERCASTLIB_EXPORTS
 #define MISTERCASTLIB_API extern "C" __declspec(dllexport)
 #else
@@ -37,14 +41,7 @@ enum CropMode : int
     X5,
     Full43,
     Full54,
-};
-
-enum Rotation : int
-{
-    None,
-    CW90,
-    CCW90,
-    Flip180
+    FullSource,
 };
 
 // CMD_INIT byte[4]. Determines bytes-per-pixel, and so the modeline byte budget.
@@ -110,7 +107,9 @@ struct SourceOptions {
     UINT16 height;
     INT16 xoffset;
     INT16 yoffset;
-    UINT8 rotation;
+    Rotation rotation;
+    SamplingMode sampling;
+    UINT_PTR windowHandle;
 };
 
 typedef void(__stdcall *log_function)(const char* message, bool error);
@@ -124,6 +123,11 @@ MISTERCASTLIB_API bool Shutdown();
 MISTERCASTLIB_API bool StartStream(const char* targetIp);
 
 MISTERCASTLIB_API bool StopStream();
+
+MISTERCASTLIB_API bool SetDiagnosticFaults(
+    UINT32 skipEvery,
+    UINT32 stallEvery,
+    UINT32 stallMilliseconds);
 
 // Applies at the next StartStream. Codec, RGB mode and MTU ride CMD_INIT and
 // cannot be changed on a live session.
@@ -167,6 +171,22 @@ MISTERCASTLIB_API bool SetModeline(
     UINT16 vtotal,
     bool interlace);
 
+// As SetModeline, with the opt-in full-height (progressive) framebuffer for
+// interlaced output: the receiver derives both display fields from one
+// full-frame blit instead of receiving alternating half-height fields.
+MISTERCASTLIB_API bool SetModelineEx(
+    double pclock,
+    UINT16 hactive,
+    UINT16 hbegin,
+    UINT16 hend,
+    UINT16 htotal,
+    UINT16 vactive,
+    UINT16 vbegin,
+    UINT16 vend,
+    UINT16 vtotal,
+    bool interlace,
+    bool progressiveFramebuffer);
+
 MISTERCASTLIB_API bool SetSource(
     UINT8 display,
     bool audio,
@@ -178,3 +198,18 @@ MISTERCASTLIB_API bool SetSource(
     INT16 xoffset,
     INT16 yoffset,
     UINT8 rotation);
+
+MISTERCASTLIB_API bool SetSourceEx(
+    UINT8 display,
+    bool audio,
+    bool preview,
+    UINT8 alignment,
+    UINT8 cropmode,
+    UINT16 width,
+    UINT16 height,
+    INT16 xoffset,
+    INT16 yoffset,
+    UINT8 rotation,
+    UINT8 sampling);
+
+MISTERCASTLIB_API bool SetCaptureWindow(UINT_PTR windowHandle);

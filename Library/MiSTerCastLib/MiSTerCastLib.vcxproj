@@ -183,8 +183,17 @@
     <ClInclude Include="nlc_codec.h" />
     <ClInclude Include="pch.h" />
     <ClInclude Include="AudioCapture.h" />
+    <ClInclude Include="AudioProcessing.h" />
+    <ClInclude Include="CaptureResources.h" />
+    <ClInclude Include="DiagnosticFaults.h" />
+    <ClInclude Include="FrameTransform.h" />
+    <ClInclude Include="GroovyProtocol.h" />
+    <ClInclude Include="InterlacePhase.h" />
+    <ClInclude Include="NetworkMtu.h" />
     <ClInclude Include="renderer_nogpu.h" />
     <ClInclude Include="rio.h" />
+    <ClInclude Include="SourceOptionsState.h" />
+    <ClInclude Include="StreamingTiming.h" />
     <ClInclude Include="VideoCapture.h" />
     <ClInclude Include="lz4\lz4.h" />
     <ClInclude Include="lz4\lz4hc.h" />
@@ -192,14 +201,7 @@
   <ItemGroup>
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="MiSTerCastLib.cpp" />
-    <!-- Vendored from Groovy_MiSTer api/ at zero source delta: they do not include
-         pch.h, so the PCH is switched off for them here rather than by editing them.
-         See PROVENANCE.md. -->
-    <ClCompile Include="groovymister.cpp">
-      <PrecompiledHeader>NotUsing</PrecompiledHeader>
-      <WarningLevel>Level1</WarningLevel>
-      <SDLCheck>false</SDLCheck>
-    </ClCompile>
+    <ClCompile Include="groovymister.cpp" />
     <ClCompile Include="nlc_codec.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <WarningLevel>Level1</WarningLevel>
