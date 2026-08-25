@@ -48,9 +48,11 @@
     </None>
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+  <!-- MiSTerCastLib.vcxproj writes to <SolutionDir>x86\<Configuration>\ (SolutionDir
+       is FrontEnd\, the directory of MiSTerCast.sln); this CLI is always x86
+       (PlatformTarget above), so that is the one output folder to copy from. LZ4
+       is compiled into MISTERCASTLIB.dll now, so there is no separate DLL to copy. -->
   <PropertyGroup>
-    <PostBuildEvent>xcopy "$(MSBuildProjectDirectory)\..\..\External\lz4\dll\msys-lz4-1.dll" "$(TargetDir)msys-lz4-1.dll*" /y
-if $(ConfigurationName) == Release xcopy "$(MSBuildProjectDirectory)\..\..\FrontEnd\Release\MISTERCASTLIB.dll" "$(TargetDir)MISTERCASTLIB.dll*" /y
-if $(ConfigurationName) == Debug xcopy "$(MSBuildProjectDirectory)\..\..\FrontEnd\Debug\MISTERCASTLIB.dll" "$(TargetDir)MISTERCASTLIB.dll*" /y</PostBuildEvent>
+    <PostBuildEvent>xcopy "$(MSBuildProjectDirectory)\..\..\FrontEnd\x86\$(ConfigurationName)\MISTERCASTLIB.dll" "$(TargetDir)MISTERCASTLIB.dll*" /y</PostBuildEvent>
   </PropertyGroup>
 </Project>

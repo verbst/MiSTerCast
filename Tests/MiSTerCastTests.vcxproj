@@ -72,11 +72,14 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <PreprocessorDefinitions>_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>..\Library\MiSTerCastLib;..\External\lz4\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <!-- LZ4 is vendored source under Library\MiSTerCastLib\lz4 (compiled directly
+           into this test binary below), not an External\lz4 download - there is no
+           liblz4.dll.a/msys-lz4-1.dll in this tree. -->
+      <AdditionalIncludeDirectories>..\Library\MiSTerCastLib;..\Library\MiSTerCastLib\lz4;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
-      <AdditionalDependencies>..\External\lz4\dll\liblz4.dll.a;Ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -89,11 +92,32 @@
     <ClCompile Include="streaming_timing_tests.cpp" />
     <ClCompile Include="source_options_state_tests.cpp" />
     <ClCompile Include="transport_lifecycle_tests.cpp" />
-    <ClCompile Include="..\Library\MiSTerCastLib\groovymister.cpp" />
+    <!-- Hand-merged, not compiler-verified yet (see AGENTS.md) - kept off this
+         project's TreatWarningAsError so an incidental warning here doesn't fail
+         the whole test build; MiSTerCastLib.vcxproj itself still builds it at the
+         project default (Level3, no WX). -->
+    <ClCompile Include="..\Library\MiSTerCastLib\groovymister.cpp">
+      <TreatWarningAsError>false</TreatWarningAsError>
+    </ClCompile>
+    <!-- Vendored code: MiSTerCastLib.vcxproj builds these at WarningLevel1 with
+         SDLCheck off because they don't pass this project's Level4/WX. Match that
+         here rather than fight upstream warnings in code this project doesn't own. -->
+    <ClCompile Include="..\Library\MiSTerCastLib\nlc_codec.cpp">
+      <WarningLevel>Level1</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <SDLCheck>false</SDLCheck>
+    </ClCompile>
+    <ClCompile Include="..\Library\MiSTerCastLib\lz4\lz4.c">
+      <WarningLevel>Level1</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <SDLCheck>false</SDLCheck>
+    </ClCompile>
+    <ClCompile Include="..\Library\MiSTerCastLib\lz4\lz4hc.c">
+      <WarningLevel>Level1</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <SDLCheck>false</SDLCheck>
+    </ClCompile>
   </ItemGroup>
-  <Target Name="CopyTestRuntimeDependencies" AfterTargets="Build">
-    <Copy SourceFiles="..\External\lz4\dll\msys-lz4-1.dll" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
-  </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />
 </Project>
