@@ -88,6 +88,35 @@ inline double FieldPeriodMilliseconds(
     return linePeriod * verticalTotal / (interlaced ? 2.0 : 1.0);
 }
 
+// Target wire rate for pacing a UDP video payload burst release. Kept just
+// under a gigabit link so a source NIC faster than the MiSTer's (e.g. a 2.5G
+// adapter through a switch down to the MiSTer's 1G port) cannot overrun the
+// switch's egress buffer toward the MiSTer. That overrun silently drops the
+// tail of the burst; the FPGA then sees an incomplete field and, on
+// interlaced modes, locks into its fallback framebuffer - visible as the
+// picture periodically freezing/jumping. Ported from the equivalent fix in
+// MiSTerCast-Linux (StreamTimingPolicy), verified there on a 2.5G -> switch
+// -> 1G bench at 720x576i: 0 fallback frames across 68k+ frames, versus
+// failing within ~4100 frames unpaced.
+constexpr uint64_t PacingBitsPerSecond = 950'000'000;
+// Packets released between pacing gates, and the per-packet wire overhead
+// (Ethernet + IP + UDP headers) used to convert a packet count to wire bits.
+// A payload with this many packets or fewer (audio, small/highly-compressed
+// video fields) is sent unpaced in one commit.
+constexpr size_t PacingBurstPackets = 32;
+constexpr uint32_t PacingPacketWireOverheadBytes = 66;
+
+// Nanoseconds after the start of a paced send at which `wireBytesReleased`
+// bytes should have gone out at the target rate. Pure integer arithmetic.
+inline uint64_t PacingReleaseOffsetNanoseconds(
+    uint64_t wireBytesReleased,
+    uint64_t bitsPerSecond = PacingBitsPerSecond) noexcept
+{
+    if (bitsPerSecond == 0)
+        return 0;
+    return wireBytesReleased * 8ULL * 1'000'000'000ULL / bitsPerSecond;
+}
+
 inline uint16_t RequestedSyncLine(
     uint16_t verticalTotal,
     double frameDelay,

@@ -75,6 +75,12 @@ The sender deliberately has no UDP socket-rate shaper, adaptive interlaced reser
 
 Wi-Fi can overwhelm the receiver badly enough to make the MiSTer-side menu unresponsive. The same behavior has been observed with the original sender, so the practical recovery is a good direct-Ethernet stream or a core restart, not more sender buffering.
 
+### Video payload pacing (link-speed mismatch)
+
+`SendStream`'s RIO path commits a whole field's packets to the NIC in one batch once it has more than `mistercast::PacingBurstPackets` (32) packets queued (`StreamingTiming.h`). A source NIC faster than the MiSTer's gigabit link (e.g. 2.5G through a switch) can otherwise overrun the switch's egress buffer toward the MiSTer; the tail of the burst is silently dropped, the FPGA sees an incomplete field, and interlaced modes lock into the fallback framebuffer — visible as the picture periodically freezing or jumping, with the sender reporting no drops or errors of its own. Above that threshold, sends are released in 32-packet bursts gated on an absolute `QueryPerformanceCounter` schedule (`GroovyMister::SleepUntilQpc`) targeting `PacingBitsPerSecond` (950 Mb/s, just under gigabit). A payload at or under the threshold (audio, a small or highly-compressed field) is still sent unpaced in one commit.
+
+This is a direct port of the equivalent fix in [MiSTerCast-Linux](https://github.com/ElFDA/mistercast-linux) (`StreamTimingPolicy`/`sendPayload`), which used `sendmmsg()` + `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, ...)` for the same burst/pace split; verified there on a 2.5G → switch → 1G bench at 720x576i (0 fallback frames across 68k+ frames, versus failing within ~4100 unpaced). Confirm the Windows port the same way: a direct-Ethernet or matched-speed baseline should show no regression in `rate`/timing, and a 2.5G(or faster)-NIC-through-a-switch-to-a-1G-MiSTer bench at a large interlaced mode (720x480i/576i) should show no fallback lock and no `dropped_video` growth over a long run where the unpaced build reliably fails within a few thousand frames.
+
 ### Audio
 
 - WASAPI loopback captures the default render endpoint's 32-bit floating-point mix.

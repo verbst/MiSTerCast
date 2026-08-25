@@ -23,6 +23,7 @@ int RunStreamingTimingTests()
     using mistercast::IsValidStreamModeline;
     using mistercast::ProtocolInterlaceMode;
     using mistercast::RequestedSyncLine;
+    using mistercast::PacingReleaseOffsetNanoseconds;
 
     Check(CounterTicksTo100ns(10000000, 10000000) == 10000000);
     Check(CounterTicksTo100ns(3579545, 3579545) == 10000000);
@@ -56,6 +57,11 @@ int RunStreamingTimingTests()
     Check(ProtocolInterlaceMode(false, false) == 0);
     Check(ProtocolInterlaceMode(true, false) == 1);
     Check(ProtocolInterlaceMode(true, true) == 2);
+
+    Check(PacingReleaseOffsetNanoseconds(0) == 0);
+    Check(PacingReleaseOffsetNanoseconds(118750000) == 1000000000);
+    Check(PacingReleaseOffsetNanoseconds(49216) == 414450);
+    Check(PacingReleaseOffsetNanoseconds(1000, 0) == 0);
 
     return failures;
 }

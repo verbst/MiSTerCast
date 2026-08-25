@@ -2034,6 +2034,31 @@ bool GroovyMister::ArmRioReceiveNotification(void)
 	m_receiveNotificationArmed = true;
 	return true;
 }
+
+void GroovyMister::SleepUntilQpc(int64_t targetTicks)
+{
+	LARGE_INTEGER now;
+	QueryPerformanceCounter(&now);
+	int64_t remaining = targetTicks - now.QuadPart;
+	if (remaining <= 0)
+		return;
+
+	// Sleep() granularity (~1-15ms depending on the system timer resolution)
+	// is too coarse to land on a sub-millisecond pacing gate directly, so
+	// sleep for the bulk of the wait and spin the last ~2ms against the
+	// high-resolution counter.
+	const int64_t spinTicks = (m_timerFrequency * 2) / 1000;
+	if (remaining > spinTicks)
+	{
+		const DWORD sleepMs = static_cast<DWORD>(((remaining - spinTicks) * 1000) / m_timerFrequency);
+		if (sleepMs > 0)
+			Sleep(sleepMs);
+	}
+	do
+	{
+		QueryPerformanceCounter(&now);
+	} while (now.QuadPart < targetTicks);
+}
 #endif
 
 bool GroovyMister::Send(void *cmd, int cmdSize)
@@ -2088,10 +2113,39 @@ bool GroovyMister::SendStream(uint8_t whichBuffer, uint8_t field, uint32_t bytes
 			return false;
 		}
 
+		// Pace a large video payload so its release does not exceed a gigabit
+		// link: committing the whole field in one RIO batch sends it at
+		// whatever rate the local NIC can push, and a source NIC faster than
+		// the MiSTer's link (e.g. 2.5G through a switch down to the MiSTer's
+		// 1G port) can overrun the switch's egress buffer toward the MiSTer.
+		// That drops the tail of the burst silently; the FPGA then sees an
+		// incomplete field and, on interlaced modes, locks into its fallback
+		// framebuffer. A small payload (audio, a highly-compressed field) is
+		// still sent unpaced in one commit. See PacingBitsPerSecond.
+		const bool paced = requestCount > mistercast::PacingBurstPackets;
+		const uint64_t bytesPerPacket = static_cast<uint64_t>(m_mtu) + mistercast::PacingPacketWireOverheadBytes;
+		LARGE_INTEGER pacingStart = {};
+		if (paced)
+			QueryPerformanceCounter(&pacingStart);
+
 		DWORD flags = RIO_MSG_DONT_NOTIFY | RIO_MSG_DEFER;
 		ULONG queued = 0;
 		while (bytesSended < bytesToSend)
 		{
+			if (paced && queued > 0 && (queued % mistercast::PacingBurstPackets) == 0)
+			{
+				if (!m_rio.RIOSend(m_requestQueue, NULL, 0, RIO_MSG_COMMIT_ONLY, NULL))
+				{
+					RecordRioError("RIO stream commit");
+					return false;
+				}
+				const uint64_t offsetNs = mistercast::PacingReleaseOffsetNanoseconds(
+					static_cast<uint64_t>(queued) * bytesPerPacket);
+				const int64_t offsetTicks = static_cast<int64_t>(
+					offsetNs * static_cast<uint64_t>(m_timerFrequency) / 1'000'000'000ULL);
+				SleepUntilQpc(pacingStart.QuadPart + offsetTicks);
+			}
+
 			const ULONG chunkSize = (bytesToSend - bytesSended >= m_mtu)
 				? m_mtu
 				: bytesToSend - bytesSended;

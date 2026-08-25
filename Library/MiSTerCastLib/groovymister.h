@@ -414,6 +414,12 @@ class GroovyMister
 	bool ArmRioReceiveNotification(void);
 	void RecordRioError(const char* operation);
 	void ReleaseRioSendContext(void* requestContext);
+	// Blocks the calling thread until QueryPerformanceCounter reaches
+	// targetTicks: Sleep() for the bulk of the wait (its ~1-15ms granularity
+	// is too coarse for sub-millisecond pacing gates on its own), then spins
+	// against the high-resolution counter for the last ~2ms. Used to pace
+	// SendStream's video payload release; see PacingBitsPerSecond.
+	void SleepUntilQpc(int64_t targetTicks);
 #endif
 	void setTimeStart(void);
 	void setTimeEnd(void);
