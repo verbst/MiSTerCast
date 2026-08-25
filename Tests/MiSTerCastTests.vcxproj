@@ -79,7 +79,11 @@
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
-      <AdditionalDependencies>Ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <!-- groovymister.cpp includes pch.h, which pulls in the C++/WinRT headers used
+           for window capture; linking it here needs the same WinRT activation
+           functions as MiSTerCastLib.vcxproj even though this test binary never
+           actually captures a window. -->
+      <AdditionalDependencies>Ws2_32.lib;WindowsApp.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
