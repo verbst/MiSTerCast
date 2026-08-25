@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Windows;
@@ -7,11 +7,15 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using Microsoft.Win32;
 using System.Globalization;
 using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading.Tasks;
 
 namespace MiSTerCast
 {
@@ -42,6 +46,26 @@ namespace MiSTerCast
         public Int16 xoffset;
         public Int16 yoffset;
         public byte rotation;
+        public byte sampling;
+    }
+
+    sealed class WindowCaptureSource
+    {
+        public IntPtr Handle { get; set; }
+        public string Title { get; set; }
+        public string ProcessName { get; set; }
+
+        public string Key
+        {
+            get { return ProcessName + "\t" + Title; }
+        }
+
+        public override string ToString()
+        {
+            return String.IsNullOrWhiteSpace(ProcessName)
+                ? Title
+                : Title + " — " + ProcessName;
+        }
     }
 
     public partial class MainWindow : Window
@@ -51,6 +75,49 @@ namespace MiSTerCast
         HelpWindow helpWindow = null;
         const string lastSaveFilename = "lastsave.dat";
         string currentSaveFilename = null;
+        private StreamWriter diagnosticLogWriter;
+        private string diagnosticLogPath;
+        private TextBlock telemetryLogText;
+        private bool isRefreshingWindowSources;
+        private bool isLoadingCaptureSettings;
+
+        private delegate bool EnumWindowsCallback(IntPtr windowHandle, IntPtr parameter);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool EnumWindows(EnumWindowsCallback callback, IntPtr parameter);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool IsWindowVisible(IntPtr windowHandle);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern int GetWindowText(IntPtr windowHandle, StringBuilder text, int maximumCount);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern int GetWindowTextLength(IntPtr windowHandle);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern uint GetWindowThreadProcessId(IntPtr windowHandle, out uint processId);
+
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongW", SetLastError = true)]
+        private static extern int GetWindowLong(IntPtr windowHandle, int index);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetWindow(IntPtr windowHandle, uint command);
+
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmGetWindowAttribute(
+            IntPtr windowHandle,
+            int attribute,
+            out int value,
+            int valueSize);
+
+        private const int ExtendedWindowStyleIndex = -20;
+        private const int ToolWindowStyle = 0x00000080;
+        private const int AppWindowStyle = 0x00040000;
+        private const uint GetOwnerWindow = 4;
+        private const int DwmWindowAttributeCloaked = 14;
 
         private void InitializeMiSTerCast()
         {
@@ -63,6 +130,7 @@ namespace MiSTerCast
             {
                 // Push the stream options first: the modeline's byte budget
                 // depends on the RGB mode, so validation needs them in place.
+                // OnStreamOptionsChanged calls OnModelineChanged internally.
                 OnStreamOptionsChanged();
             }
         }
@@ -70,6 +138,12 @@ namespace MiSTerCast
         public MainWindow()
         {
             InitializeComponent();
+            string diagnosticLogError = InitializeDiagnosticLog();
+            if (diagnosticLogError == null)
+                Log("Diagnostic log: " + diagnosticLogPath);
+            else
+                Log("Creating diagnostic log failed: " + diagnosticLogError, true);
+            RefreshWindowSources(null, true);
             ReadModelinesFile();
             PopulateModelineDropdown();
             InitializeMiSTerCast();
@@ -80,6 +154,8 @@ namespace MiSTerCast
             if (isStreaming)
                 MiSTerCastInterop.StopStream();
             MiSTerCastInterop.Shutdown();
+            diagnosticLogWriter?.Dispose();
+            diagnosticLogWriter = null;
             helpWindow.Close();
         }
 
@@ -146,7 +222,7 @@ namespace MiSTerCast
             }
         }
 
-        private void ToggleStreamButton_Click(object sender, RoutedEventArgs e)
+        private async void ToggleStreamButton_Click(object sender, RoutedEventArgs e)
         {
             if (isStreaming)
             {
@@ -154,10 +230,10 @@ namespace MiSTerCast
                 {
                     isStreaming = false;
                     ToggleStreamButton.Content = "Start Stream";
-                    CaptureSourceBox.IsEnabled = true;
+                    SetCaptureSelectionEnabled(true);
+                    SetStreamControlsEnabled(true);
                     EnableAudioCheckBox.IsEnabled = true;
                     ApplyModelineButton.IsEnabled = false;
-                    SetStreamControlsEnabled(true);
                 }
             }
             else
@@ -178,24 +254,57 @@ namespace MiSTerCast
 
                     EnablePreviewCheckBox.IsChecked = false;
                     IPAddress ipAddress = null;
-                    if (!IPAddress.TryParse(TargetIpAddresTextBox.Text, out ipAddress))
+                    string target = TargetIpAddresTextBox.Text.Trim();
+                    if (!IPAddress.TryParse(target, out ipAddress))
                     {
+                        if (target.Length == 0 || target.All(character => Char.IsDigit(character) || character == '.'))
+                        {
+                            Log("Invalid IPv4 address: " + target, true);
+                            return;
+                        }
+
+                        ToggleStreamButton.IsEnabled = false;
+                        ToggleStreamButton.Content = "Resolving...";
                         try
                         {
-                            ipAddress = Dns.GetHostEntry(TargetIpAddresTextBox.Text).AddressList[0];
+                            Task<IPAddress[]> resolveTask = Dns.GetHostAddressesAsync(target);
+                            if (await Task.WhenAny(resolveTask, Task.Delay(TimeSpan.FromSeconds(5))) != resolveTask)
+                            {
+                                Log("Resolving target host timed out after five seconds: " + target, true);
+                                return;
+                            }
+
+                            ipAddress = (await resolveTask).FirstOrDefault(
+                                address => address.AddressFamily == AddressFamily.InterNetwork);
+                            if (ipAddress == null)
+                            {
+                                Log("Target host has no IPv4 address: " + target, true);
+                                return;
+                            }
+                            Log("Resolved target " + target + " to " + ipAddress + ".");
                         }
                         catch (Exception exception)
                         {
                             Log("Resolving target IP address failed: " + exception.Message, true);
                             return;
                         }
+                        finally
+                        {
+                            ToggleStreamButton.IsEnabled = true;
+                            ToggleStreamButton.Content = "Start Stream";
+                        }
+                    }
+                    else if (ipAddress.AddressFamily != AddressFamily.InterNetwork)
+                    {
+                        Log("Only IPv4 target addresses are supported.", true);
+                        return;
                     }
 
                     if (MiSTerCastInterop.StartStream(ipAddress.ToString()))
                     {
                         isStreaming = true;
                         ToggleStreamButton.Content = "Stop Stream";
-                        CaptureSourceBox.IsEnabled = false;
+                        SetCaptureSelectionEnabled(false);
                         EnableAudioCheckBox.IsEnabled = false;
                         // Codec, RGB mode and MTU ride CMD_INIT; they cannot be
                         // changed until the session is torn down and rebuilt.
@@ -203,6 +312,14 @@ namespace MiSTerCast
                     }
                 }
             }
+        }
+
+        private void SetCaptureSelectionEnabled(bool enabled)
+        {
+            CaptureModeBox.IsEnabled = enabled;
+            CaptureSourceBox.IsEnabled = enabled;
+            WindowSourceBox.IsEnabled = enabled;
+            RefreshWindowsButton.IsEnabled = enabled;
         }
 
         #region Stream Options
@@ -265,7 +382,16 @@ namespace MiSTerCast
 
         #region Settings
 
-        const int SettingsVersion = 2;
+        // Version 1 (shared prefix through CaptureYOffset) and this merge's
+        // version 5 are the only formats this build reads back reliably.
+        // Versions 2-4 were produced by one of the two pre-merge forks with
+        // mutually incompatible field layouts past that shared prefix (one
+        // inserted a field before the capture block, the other appended a
+        // block after it) - there is no way to tell which produced a given
+        // file from the version number alone, so LoadSaveFileFromStream stops
+        // reading right after the shared prefix for those and leaves the rest
+        // at defaults rather than risk misreading a field.
+        const int SettingsVersion = 5;
 
         private void SaveSettingsButton_Click(object sender, RoutedEventArgs e)
         {
@@ -279,7 +405,7 @@ namespace MiSTerCast
                     saveFileDialog.InitialDirectory = Path.GetDirectoryName(currentSaveFilename);
                     saveFileDialog.FileName = Path.GetFileName(currentSaveFilename);
                 }
-                
+
                 if (saveFileDialog.ShowDialog().Value)
                 {
                     if (!String.IsNullOrWhiteSpace(saveFileDialog.FileName))
@@ -303,6 +429,13 @@ namespace MiSTerCast
                                 sw.WriteLine(vendTextBox.Text);
                                 sw.WriteLine(vtotalTextBox.Text);
                                 sw.WriteLine(interlacedCheckBox.IsChecked.Value ? 1 : 0);
+                                sw.WriteLine(ProgressiveFramebufferCheckBox.IsChecked.Value ? 1 : 0);
+
+                                sw.WriteLine(CaptureModeBox.SelectedIndex);
+                                WindowCaptureSource selectedWindow = WindowSourceBox.SelectedItem as WindowCaptureSource;
+                                sw.WriteLine(selectedWindow == null
+                                    ? String.Empty
+                                    : selectedWindow.Key.Replace("\r", " ").Replace("\n", " "));
 
                                 sw.WriteLine(CaptureSourceBox.SelectedIndex);
                                 sw.WriteLine(RotateComboBox.SelectedIndex);
@@ -312,8 +445,8 @@ namespace MiSTerCast
                                 sw.WriteLine(CaptureHeight.Text);
                                 sw.WriteLine(CaptureXOffset.Text);
                                 sw.WriteLine(CaptureYOffset.Text);
+                                sw.WriteLine(SamplingComboBox.SelectedIndex);
 
-                                // Version 2 additions, appended so version 1 files still load.
                                 sw.WriteLine(CodecComboBox.SelectedIndex);
                                 sw.WriteLine(NlcPackComboBox.SelectedIndex);
                                 sw.WriteLine(NearLevelComboBox.SelectedIndex);
@@ -394,6 +527,42 @@ namespace MiSTerCast
             vtotalTextBox.Text = sr.ReadLine();
             interlacedCheckBox.IsChecked = sr.ReadLine() == "1" ? true : false;
 
+            if (settingsVersion >= 2 && settingsVersion < SettingsVersion)
+            {
+                // A pre-merge fjsj or verbst file: the shared v1 prefix above is
+                // identical between both forks, but they diverge from here in
+                // mutually incompatible ways. Stop reading rather than guess.
+                ProgressiveFramebufferCheckBox.IsChecked = false;
+                CodecComboBox.SelectedIndex = (int)MiSTerCastInterop.Codec.LZ4;
+                RgbModeComboBox.SelectedIndex = (int)MiSTerCastInterop.RgbMode.Rgb888;
+                MtuComboBox.SelectedIndex = 0;
+                Log("Loaded a pre-merge settings file (version " + settingsVersion +
+                    "): only the modeline was restored. Reconfigure capture and stream options and save again.", true);
+                OnStreamOptionsChanged();
+                return;
+            }
+
+            bool savedProgressiveFramebuffer = settingsVersion >= SettingsVersion && sr.ReadLine() == "1";
+            ProgressiveFramebufferCheckBox.IsChecked =
+                interlacedCheckBox.IsChecked == true && savedProgressiveFramebuffer;
+
+            int captureMode = 0;
+            string savedWindowKey = null;
+            if (settingsVersion >= SettingsVersion)
+            {
+                captureMode = int.Parse(sr.ReadLine());
+                savedWindowKey = sr.ReadLine();
+            }
+            isLoadingCaptureSettings = true;
+            CaptureModeBox.SelectedIndex = Math.Max(0, Math.Min(captureMode, CaptureModeBox.Items.Count - 1));
+            isLoadingCaptureSettings = false;
+            if (CaptureModeBox.SelectedIndex == 1)
+            {
+                RefreshWindowSources(savedWindowKey, false);
+                if (WindowSourceBox.SelectedItem == null)
+                    Log("The saved capture window is not currently available. Restore it and refresh the window list.", true);
+            }
+
             CaptureSourceBox.SelectedIndex = Math.Min(int.Parse(sr.ReadLine()), CaptureSourceBox.Items.Count - 1);
             RotateComboBox.SelectedIndex = Math.Min(int.Parse(sr.ReadLine()), RotateComboBox.Items.Count - 1);
             EnableAudioCheckBox.IsChecked = sr.ReadLine() == "1" ? true : false;
@@ -403,8 +572,12 @@ namespace MiSTerCast
             CaptureXOffset.Text = sr.ReadLine();
             CaptureYOffset.Text = sr.ReadLine();
 
-            if (settingsVersion >= 2)
+            // A version 1 file (the common ancestor format both forks fell back
+            // to) ends here - everything below is new to this merge's version 5.
+            if (settingsVersion >= SettingsVersion)
             {
+                SamplingComboBox.SelectedIndex = Math.Max(0, Math.Min(int.Parse(sr.ReadLine()), SamplingComboBox.Items.Count - 1));
+
                 CodecComboBox.SelectedIndex = Math.Min(int.Parse(sr.ReadLine()), CodecComboBox.Items.Count - 1);
                 NlcPackComboBox.SelectedIndex = Math.Min(int.Parse(sr.ReadLine()), NlcPackComboBox.Items.Count - 1);
                 NearLevelComboBox.SelectedIndex = Math.Min(int.Parse(sr.ReadLine()), NearLevelComboBox.Items.Count - 1);
@@ -416,13 +589,14 @@ namespace MiSTerCast
             }
             else
             {
-                // A version 1 file predates these settings; it was written by a
-                // build that always used LZ4 / RGB888 / MTU 1500, so keep that
-                // rather than silently moving the user onto NLC.
+                // A version 1 file predates codec/RGB mode/sampling selection; it
+                // was written by a build that always used LZ4, RGB888 and Point
+                // sampling, so keep that rather than silently moving the user
+                // onto NLC or a different sampling mode.
+                SamplingComboBox.SelectedIndex = (int)MiSTerCastInterop.SamplingMode.Point;
                 CodecComboBox.SelectedIndex = (int)MiSTerCastInterop.Codec.LZ4;
                 RgbModeComboBox.SelectedIndex = (int)MiSTerCastInterop.RgbMode.Rgb888;
                 MtuComboBox.SelectedIndex = 0;
-                Log("Loaded a version 1 settings file: codec kept at LZ4, as that is what it was saved with.");
             }
 
             OnStreamOptionsChanged();
@@ -482,14 +656,67 @@ namespace MiSTerCast
 
         private MiSTerCastInterop.LogDelegate LogDelegate;
 
+        private string InitializeDiagnosticLog()
+        {
+            try
+            {
+                string logDirectory = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "MiSTerCast",
+                    "Logs");
+                Directory.CreateDirectory(logDirectory);
+                diagnosticLogPath = Path.Combine(
+                    logDirectory,
+                    "MiSTerCast-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".log");
+                diagnosticLogWriter = new StreamWriter(
+                    new FileStream(diagnosticLogPath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite),
+                    new UTF8Encoding(false));
+                diagnosticLogWriter.AutoFlush = true;
+                return null;
+            }
+            catch (Exception exception)
+            {
+                diagnosticLogWriter = null;
+                return exception.Message;
+            }
+        }
+
         private void Log(string message, bool error = false)
         {
+            string timestampedMessage = String.Format(
+                CultureInfo.InvariantCulture,
+                "[{0:yyyy-MM-dd HH:mm:ss.fff}] [{1}] {2}",
+                DateTime.Now,
+                error ? "ERROR" : "INFO",
+                message);
             this.Dispatcher.InvokeAsync(() =>
             {
-                TextBlock logText = new TextBlock() { Text = message };
+                try
+                {
+                    diagnosticLogWriter?.WriteLine(timestampedMessage);
+                }
+                catch
+                {
+                    diagnosticLogWriter?.Dispose();
+                    diagnosticLogWriter = null;
+                }
+
+                bool telemetry = message.StartsWith("[stream]", StringComparison.Ordinal);
+                TextBlock logText;
+                if (telemetry && telemetryLogText != null)
+                {
+                    logText = telemetryLogText;
+                    logText.Text = message;
+                }
+                else
+                {
+                    logText = new TextBlock() { Text = message };
+                    LogPanel.Children.Add(logText);
+                    if (telemetry)
+                        telemetryLogText = logText;
+                }
                 if (error)
                     logText.Background = Brushes.Pink;
-                LogPanel.Children.Add(logText);//.Insert(0, (logText));
             });
         }
 
@@ -519,11 +746,129 @@ namespace MiSTerCast
 
         private SourceOptions currentSourceOptions;
 
+        private List<WindowCaptureSource> EnumerateCaptureWindows()
+        {
+            List<WindowCaptureSource> windows = new List<WindowCaptureSource>();
+            uint ownProcessId = (uint)Process.GetCurrentProcess().Id;
+            EnumWindows((windowHandle, parameter) =>
+            {
+                if (!IsWindowVisible(windowHandle))
+                    return true;
+
+                int titleLength = GetWindowTextLength(windowHandle);
+                if (titleLength <= 0)
+                    return true;
+
+                uint processId;
+                GetWindowThreadProcessId(windowHandle, out processId);
+                if (processId == 0 || processId == ownProcessId)
+                    return true;
+
+                int extendedStyle = GetWindowLong(windowHandle, ExtendedWindowStyleIndex);
+                bool explicitAppWindow = (extendedStyle & AppWindowStyle) != 0;
+                if ((extendedStyle & ToolWindowStyle) != 0 && !explicitAppWindow)
+                    return true;
+                if (GetWindow(windowHandle, GetOwnerWindow) != IntPtr.Zero && !explicitAppWindow)
+                    return true;
+
+                int cloaked;
+                if (DwmGetWindowAttribute(
+                    windowHandle,
+                    DwmWindowAttributeCloaked,
+                    out cloaked,
+                    sizeof(int)) == 0 && cloaked != 0)
+                {
+                    return true;
+                }
+
+                StringBuilder titleBuilder = new StringBuilder(titleLength + 1);
+                if (GetWindowText(windowHandle, titleBuilder, titleBuilder.Capacity) <= 0)
+                    return true;
+
+                string title = titleBuilder.ToString().Trim();
+                if (title.Length == 0)
+                    return true;
+
+                string processName = String.Empty;
+                try
+                {
+                    processName = Process.GetProcessById((int)processId).ProcessName;
+                }
+                catch
+                {
+                }
+
+                windows.Add(new WindowCaptureSource
+                {
+                    Handle = windowHandle,
+                    Title = title,
+                    ProcessName = processName
+                });
+                return true;
+            }, IntPtr.Zero);
+
+            return windows
+                .OrderBy(window => window.Title, StringComparer.CurrentCultureIgnoreCase)
+                .ThenBy(window => window.ProcessName, StringComparer.CurrentCultureIgnoreCase)
+                .ToList();
+        }
+
+        private void RefreshWindowSources(string preferredKey, bool selectFirst)
+        {
+            WindowCaptureSource previousSelection = WindowSourceBox.SelectedItem as WindowCaptureSource;
+            IntPtr previousHandle = previousSelection == null ? IntPtr.Zero : previousSelection.Handle;
+            string selectionKey = preferredKey ?? (previousSelection == null ? null : previousSelection.Key);
+            List<WindowCaptureSource> windows = EnumerateCaptureWindows();
+
+            WindowCaptureSource selected = windows.FirstOrDefault(window => window.Handle == previousHandle);
+            if (selected == null && !String.IsNullOrEmpty(selectionKey))
+                selected = windows.FirstOrDefault(window => window.Key == selectionKey);
+            if (selected == null && selectFirst)
+                selected = windows.FirstOrDefault();
+
+            isRefreshingWindowSources = true;
+            WindowSourceBox.ItemsSource = windows;
+            WindowSourceBox.SelectedItem = selected;
+            isRefreshingWindowSources = false;
+
+            if (CaptureModeBox.SelectedIndex == 1 && isInitialized)
+                OnCaptureSourceChanged();
+        }
+
+        private void CaptureMode_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (WindowSourcePanel == null || CaptureSourceBox == null)
+                return;
+
+            bool captureWindow = CaptureModeBox.SelectedIndex == 1;
+            CaptureSourceBox.Visibility = captureWindow ? Visibility.Collapsed : Visibility.Visible;
+            WindowSourcePanel.Visibility = captureWindow ? Visibility.Visible : Visibility.Collapsed;
+            if (captureWindow && WindowSourceBox.Items.Count == 0)
+                RefreshWindowSources(null, true);
+            if (captureWindow && !isLoadingCaptureSettings && CropComboBox != null)
+                CropComboBox.SelectedIndex = 8;
+
+            if (isInitialized)
+                OnCaptureSourceChanged();
+        }
+
+        private void WindowSource_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (!isRefreshingWindowSources && isInitialized && CaptureModeBox.SelectedIndex == 1)
+                OnCaptureSourceChanged();
+        }
+
+        private void RefreshWindowsButton_Click(object sender, RoutedEventArgs e)
+        {
+            RefreshWindowSources(null, true);
+        }
+
         private void OnCaptureSourceChanged()
         {
             currentSourceOptions.display = (byte)CaptureSourceBox.SelectedIndex;
             currentSourceOptions.alignment = (byte)AlignmentBox.SelectedIndex;
             currentSourceOptions.rotation = (byte)RotateComboBox.SelectedIndex;
+            currentSourceOptions.sampling = (byte)SamplingComboBox.SelectedIndex;
             currentSourceOptions.cropmode = (byte)CropComboBox.SelectedIndex;
             CaptureWidth.IsEnabled = CropComboBox.SelectedIndex == 0;
             CaptureHeight.IsEnabled = CropComboBox.SelectedIndex == 0;
@@ -537,9 +882,20 @@ namespace MiSTerCast
             PreviewImage.Visibility = currentSourceOptions.preview ? Visibility.Visible : Visibility.Hidden;
             PreviewDisabledLabel.Visibility = currentSourceOptions.preview ? Visibility.Hidden : Visibility.Visible;
 
+            IntPtr captureWindowHandle = IntPtr.Zero;
+            if (CaptureModeBox.SelectedIndex == 1)
+            {
+                WindowCaptureSource selectedWindow = WindowSourceBox.SelectedItem as WindowCaptureSource;
+                if (selectedWindow == null)
+                    return;
+                captureWindowHandle = selectedWindow.Handle;
+            }
+            if (!MiSTerCastInterop.SetCaptureWindow(captureWindowHandle))
+                return;
+
             if (currentSourceOptions.width > 0 && currentSourceOptions.height > 0)
             {
-                MiSTerCastInterop.SetSource(
+                MiSTerCastInterop.SetSourceEx(
                     currentSourceOptions.display,
                     currentSourceOptions.audio,
                     currentSourceOptions.preview,
@@ -549,7 +905,8 @@ namespace MiSTerCast
                     currentSourceOptions.height,
                     currentSourceOptions.xoffset,
                     currentSourceOptions.yoffset,
-                    currentSourceOptions.rotation);
+                    currentSourceOptions.rotation,
+                    currentSourceOptions.sampling);
             }
         }
 
@@ -628,7 +985,7 @@ namespace MiSTerCast
 
             if (isInitialized && ValidateCurrentModeline())
             {
-                MiSTerCastInterop.SetModeline(
+                if (!MiSTerCastInterop.SetModelineEx(
                     currentModeLine.pclock,
                     currentModeLine.hactive,
                     currentModeLine.hbegin,
@@ -638,7 +995,11 @@ namespace MiSTerCast
                     currentModeLine.vbegin,
                     currentModeLine.vend,
                     currentModeLine.vtotal,
-                    currentModeLine.interlace);
+                    currentModeLine.interlace,
+                    currentModeLine.interlace && ProgressiveFramebufferCheckBox.IsChecked == true))
+                {
+                    return;
+                }
 
                 UpdateCropSize();
                 OnCaptureSourceChanged();
@@ -648,9 +1009,9 @@ namespace MiSTerCast
         // Groovy integration handoff section 4.7. MiSTerCast takes modelines from
         // the user and from modelines.dat with no switchres preset bounding them,
         // so this check is the only thing keeping a bad one off the wire - and a
-        // large one inside the client's fixed frame buffer.
-        private const int GroovyFrameBufferBytes = 1245312; // BUFFER_SIZE, 720x576x3
-
+        // large one inside the client's fixed frame buffer. The native side is the
+        // authority (ValidateModelineFor in renderer_nogpu.h); this just surfaces
+        // its verdict in the UI.
         private bool ValidateCurrentModeline()
         {
             if (!isInitialized)
@@ -687,12 +1048,12 @@ namespace MiSTerCast
                         int bpp = rgbMode == (byte)MiSTerCastInterop.RgbMode.Rgba8888 ? 4
                                 : rgbMode == (byte)MiSTerCastInterop.RgbMode.Rgb565 ? 2 : 3;
                         int bytes = currentModeLine.hactive * currentModeLine.vactive * bpp;
-                        if (currentModeLine.interlace)
+                        if (currentModeLine.interlace && ProgressiveFramebufferCheckBox.IsChecked != true)
                             bytes /= 2;
                         message = string.Format(
-                            "Frame is too large for the Groovy client: {0} x {1} x {2} bytes = {3:N0}, "
-                            + "limit {4:N0}. Reduce the resolution, use RGB565, or use an interlaced mode.",
-                            currentModeLine.hactive, currentModeLine.vactive, bpp, bytes, GroovyFrameBufferBytes);
+                            "Frame is too large for the Groovy client: {0} x {1} x {2} bytes = {3:N0}. "
+                            + "Reduce the resolution, use RGB565, or use a (non full-height) interlaced mode.",
+                            currentModeLine.hactive, currentModeLine.vactive, bpp, bytes);
                     }
                     break;
 
@@ -809,7 +1170,7 @@ namespace MiSTerCast
                                         !UInt16.TryParse(values[7], out modeline.vend) ||
                                         !UInt16.TryParse(values[8], out modeline.vtotal) ||
                                         !UInt16.TryParse(values[9], out interlace))
-                
+
                                     {
                                         Log("Invalid modeline values format: " + lines[i], true);
                                         badLine = true;
@@ -862,6 +1223,19 @@ namespace MiSTerCast
 
         private void InterlacedCheckBox_Checked(object sender, RoutedEventArgs e)
         {
+            bool interlaced = interlacedCheckBox.IsChecked == true;
+            ProgressiveFramebufferCheckBox.IsEnabled = interlaced;
+            if (!interlaced && ProgressiveFramebufferCheckBox.IsChecked == true)
+            {
+                ignoreModelineChange = true;
+                ProgressiveFramebufferCheckBox.IsChecked = false;
+                ignoreModelineChange = false;
+            }
+            OnManualModelineChange();
+        }
+
+        private void ProgressiveFramebufferCheckBox_Checked(object sender, RoutedEventArgs e)
+        {
             OnManualModelineChange();
         }
 
@@ -881,7 +1255,7 @@ namespace MiSTerCast
 
         private MiSTerCastInterop.CaptureImageDelegate CaptureImageDelegate;
         private bool isPreviewEnabled = true;
-        
+
         public void CaptureImage(int width, int height, IntPtr buffer)
         {
             if (isPreviewEnabled)
