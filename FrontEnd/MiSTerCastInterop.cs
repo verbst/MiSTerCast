@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Runtime.InteropServices;
 
 namespace MiSTerCast
@@ -57,6 +57,14 @@ namespace MiSTerCast
             Rgb565 = 2
         }
 
+        // Mirrors SamplingMode in FrameTransform.h.
+        public enum SamplingMode : byte
+        {
+            Point = 0,
+            Bilinear = 1,
+            LineBlend = 2
+        }
+
         [UnmanagedFunctionPointer(CallingConvention.StdCall)]
         public delegate void LogDelegate(string message, bool error);
 
@@ -66,7 +74,7 @@ namespace MiSTerCast
         // Note on marshalling: the native side uses C++ `bool` (one byte), while
         // .NET's default for `bool` is the four-byte Win32 BOOL. Pinning both
         // arguments and returns to UnmanagedType.I1 keeps the two in step - it is
-        // only free by accident on x86, and this now builds for x64 as well.
+        // only free by accident on x86, and this also builds for x64.
 
         [DllImport("MISTERCASTLIB.dll", EntryPoint = "Initialize", CallingConvention = CallingConvention.Cdecl)]
         [return: MarshalAs(UnmanagedType.I1)]
@@ -83,6 +91,13 @@ namespace MiSTerCast
         [DllImport("MISTERCASTLIB.dll", EntryPoint = "StopStream", CallingConvention = CallingConvention.Cdecl)]
         [return: MarshalAs(UnmanagedType.I1)]
         public static extern bool StopStream();
+
+        [DllImport("MISTERCASTLIB.dll", EntryPoint = "SetDiagnosticFaults", CallingConvention = CallingConvention.Cdecl)]
+        [return: MarshalAs(UnmanagedType.I1)]
+        public static extern bool SetDiagnosticFaults(
+            UInt32 skipEvery,
+            UInt32 stallEvery,
+            UInt32 stallMilliseconds);
 
         // Applied at the next StartStream: codec, RGB mode and MTU ride CMD_INIT
         // and cannot be changed on a live session.
@@ -128,6 +143,21 @@ namespace MiSTerCast
             UInt16 vtotal,
             [MarshalAs(UnmanagedType.I1)] bool interlace);
 
+        [DllImport("MISTERCASTLIB.dll", EntryPoint = "SetModelineEx", CallingConvention = CallingConvention.Cdecl)]
+        [return: MarshalAs(UnmanagedType.I1)]
+        public static extern bool SetModelineEx(
+            Double pclock,
+            UInt16 hactive,
+            UInt16 hbegin,
+            UInt16 hend,
+            UInt16 htotal,
+            UInt16 vactive,
+            UInt16 vbegin,
+            UInt16 vend,
+            UInt16 vtotal,
+            [MarshalAs(UnmanagedType.I1)] bool interlace,
+            [MarshalAs(UnmanagedType.I1)] bool progressiveFramebuffer);
+
         [DllImport("MISTERCASTLIB.dll", EntryPoint = "SetSource", CallingConvention = CallingConvention.Cdecl)]
         [return: MarshalAs(UnmanagedType.I1)]
         public static extern bool SetSource(
@@ -141,5 +171,24 @@ namespace MiSTerCast
             Int16 xoffset,
             Int16 yoffset,
             byte rotation);
+
+        [DllImport("MISTERCASTLIB.dll", EntryPoint = "SetSourceEx", CallingConvention = CallingConvention.Cdecl)]
+        [return: MarshalAs(UnmanagedType.I1)]
+        public static extern bool SetSourceEx(
+            byte display,
+            [MarshalAs(UnmanagedType.I1)] bool audio,
+            [MarshalAs(UnmanagedType.I1)] bool preview,
+            byte alignment,
+            byte cropmode,
+            UInt16 width,
+            UInt16 height,
+            Int16 xoffset,
+            Int16 yoffset,
+            byte rotation,
+            byte sampling);
+
+        [DllImport("MISTERCASTLIB.dll", EntryPoint = "SetCaptureWindow", CallingConvention = CallingConvention.Cdecl)]
+        [return: MarshalAs(UnmanagedType.I1)]
+        public static extern bool SetCaptureWindow(IntPtr windowHandle);
     }
 }
