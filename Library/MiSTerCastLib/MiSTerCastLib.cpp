@@ -39,12 +39,16 @@ std::atomic_bool capturing_screen = false;
 void capture_screen()
 {
     LogMessage("Screen capture starting.");
+    // Single-window capture (Windows.Graphics.Capture) needs a COM apartment
+    // on the calling thread; this worker is a raw std::thread with none.
+    winrt::init_apartment(winrt::apartment_type::multi_threaded);
     capturing_screen = true;
     do
     {
         TickVideoCapture();
     } while (!stopCapture);
     capturing_screen = false;
+    winrt::uninit_apartment();
     LogMessage("Screen capture stopped.");
 }
 
@@ -332,6 +336,43 @@ MISTERCASTLIB_API bool SetSource(
         InitializeVideoCapture(source_config.display, captureFunction);
         captureScreenTask = std::make_unique<std::thread>(capture_screen);
     }
+
+    SetSourceOptions(&source_config);
+
+    return true;
+}
+
+MISTERCASTLIB_API bool SetCaptureWindow(UINT_PTR windowHandle)
+{
+    if (!initialized)
+    {
+        LogMessage("MiSTerCast must be initialized before selecting a capture window.", true);
+        return false;
+    }
+    if (windowHandle != 0 && !IsWindow(reinterpret_cast<HWND>(windowHandle)))
+    {
+        LogMessage("The selected capture window no longer exists.", true);
+        return false;
+    }
+    if (source_config.windowHandle == windowHandle)
+        return true;
+
+    source_config.windowHandle = windowHandle;
+
+    // Same inline stop/reinit/restart sequence SetSource already uses when the
+    // display changes: video capture cannot be swapped out from under the
+    // capture thread, so it has to be stopped first.
+    stopCapture = true;
+    do {} while (capturing_screen); // wait for threads
+    stopCapture = false;
+
+    captureScreenTask->detach();
+    CleanupVideoCapture();
+    if (!InitializeVideoCapture(source_config.display, captureFunction))
+    {
+        LogMessage("Failed to initialize the selected video capture source.", true);
+    }
+    captureScreenTask = std::make_unique<std::thread>(capture_screen);
 
     SetSourceOptions(&source_config);
 

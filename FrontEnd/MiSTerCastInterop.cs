@@ -141,5 +141,11 @@ namespace MiSTerCast
             Int16 xoffset,
             Int16 yoffset,
             byte rotation);
+
+        // windowHandle == IntPtr.Zero releases single-window capture and
+        // returns to capturing the display set by SetSource.
+        [DllImport("MISTERCASTLIB.dll", EntryPoint = "SetCaptureWindow", CallingConvention = CallingConvention.Cdecl)]
+        [return: MarshalAs(UnmanagedType.I1)]
+        public static extern bool SetCaptureWindow(IntPtr windowHandle);
     }
 }
