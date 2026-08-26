@@ -37,6 +37,7 @@ enum CropMode : int
     X5,
     Full43,
     Full54,
+    FullSource,
 };
 
 enum Rotation : int
@@ -111,6 +112,7 @@ struct SourceOptions {
     INT16 xoffset;
     INT16 yoffset;
     UINT8 rotation;
+    UINT_PTR windowHandle;  // 0 = capture the display in `display`; otherwise capture this window
 };
 
 typedef void(__stdcall *log_function)(const char* message, bool error);
@@ -178,3 +180,7 @@ MISTERCASTLIB_API bool SetSource(
     INT16 xoffset,
     INT16 yoffset,
     UINT8 rotation);
+
+// windowHandle == 0 releases single-window capture and returns to capturing
+// the display set by SetSource. Requires Windows 10 version 1903 or newer.
+MISTERCASTLIB_API bool SetCaptureWindow(UINT_PTR windowHandle);
