@@ -109,6 +109,9 @@ typedef union
 
 GroovyMister::GroovyMister()
 {
+#ifdef _WIN32
+	QueryPerformanceFrequency(&m_timerFrequency);
+#endif
 	m_verbose = 0;
 	m_lz4Frames = 0;
 	m_soundChan = 0;
@@ -1607,13 +1610,33 @@ if (USE_RIO)
 }
 
 void GroovyMister::SendStream(uint8_t whichBuffer, uint8_t field, uint32_t bytesToSend, uint32_t cSize)
-{	
+{
 	uint32_t bytesSended = 0;
 #ifdef _WIN32
 if (USE_RIO)
 {
+	// Pace large (video) payloads so the burst does not exceed the MiSTer's
+	// 1 Gb link. A faster source NIC (e.g. 2.5G) would otherwise overrun an
+	// intermediate switch's egress buffer and silently drop the tail of a
+	// field: the FPGA then sees an incomplete field and, on interlaced modes,
+	// locks into its fallback framebuffer, while the sender itself reports no
+	// drops or errors. Small payloads (audio, a highly-compressed field) are
+	// still sent in one uncommitted-then-committed burst, matching the
+	// unpaced behavior below. Direct port of the equivalent fix in
+	// MiSTerCast-Linux (StreamTimingPolicy/sendPayload).
+	static const uint32_t PACING_BURST_PACKETS = 32;
+	static const uint32_t PACING_WIRE_OVERHEAD_BYTES = 66;
+	static const uint64_t PACING_BITS_PER_SECOND = 950'000'000ULL;
+	const uint32_t packetCount = (bytesToSend + m_mtu - 1) / m_mtu;
+	const bool paced = packetCount > PACING_BURST_PACKETS;
+	const uint64_t bytesPerPacket = (uint64_t)m_mtu + PACING_WIRE_OVERHEAD_BYTES;
+	LARGE_INTEGER pacingStart = {};
+	if (paced)
+		QueryPerformanceCounter(&pacingStart);
+
 	DWORD flags = RIO_MSG_DONT_NOTIFY | RIO_MSG_DEFER;
 	int i=0;
+	uint32_t sentPackets = 0;
 	while (bytesSended < bytesToSend)
 	{
 		if (whichBuffer == 0)
@@ -1636,8 +1659,18 @@ if (USE_RIO)
 		}
 		bytesSended += m_mtu;
 		i++;
+		sentPackets++;
+
+		if (paced && (sentPackets % PACING_BURST_PACKETS == 0 || bytesSended >= bytesToSend))
+		{
+			m_rio.RIOSend(m_requestQueue, NULL, 0, RIO_MSG_COMMIT_ONLY, NULL);
+			const uint64_t wireBitsReleased = (uint64_t)sentPackets * bytesPerPacket * 8;
+			const int64_t offsetTicks = (int64_t)(wireBitsReleased * (uint64_t)m_timerFrequency.QuadPart / PACING_BITS_PER_SECOND);
+			SleepUntilQpc(pacingStart.QuadPart + offsetTicks);
+		}
 	}
-	m_rio.RIOSend(m_requestQueue, NULL, 0, RIO_MSG_COMMIT_ONLY, NULL);
+	if (!paced)
+		m_rio.RIOSend(m_requestQueue, NULL, 0, RIO_MSG_COMMIT_ONLY, NULL);
 	return;
 }
 #endif
@@ -1662,6 +1695,28 @@ if (USE_RIO)
 		bytesSended += m_mtu;
 	}
 }
+
+#ifdef _WIN32
+void GroovyMister::SleepUntilQpc(int64_t targetTicks)
+{
+	LARGE_INTEGER now;
+	QueryPerformanceCounter(&now);
+	const int64_t spinTicks = (m_timerFrequency.QuadPart * 2) / 1000; // ~2ms
+	const int64_t sleepUntil = targetTicks - spinTicks;
+
+	while (now.QuadPart < sleepUntil)
+	{
+		const int64_t remainingMs = ((sleepUntil - now.QuadPart) * 1000) / m_timerFrequency.QuadPart;
+		Sleep(remainingMs > 1 ? static_cast<DWORD>(remainingMs - 1) : 0);
+		QueryPerformanceCounter(&now);
+	}
+
+	while (now.QuadPart < targetTicks)
+	{
+		QueryPerformanceCounter(&now);
+	}
+}
+#endif
 
 inline void GroovyMister::setTimeStart(void)
 {

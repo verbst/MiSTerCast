@@ -254,6 +254,7 @@ class GroovyMister
 	LARGE_INTEGER m_tickEnd;
 	LARGE_INTEGER m_tickSync;
 	LARGE_INTEGER m_tickCongestion;
+	LARGE_INTEGER m_timerFrequency; // QueryPerformanceFrequency(), for SendStream pacing only
 #else
 	int m_sockFD;
 	int m_sockInputsFD;
@@ -344,6 +345,12 @@ class GroovyMister
 	char *AllocateBufferSpace(const DWORD bufSize, const DWORD bufCount, DWORD& totalBufferSize, DWORD& totalBufferCount);
 	void Send(void *cmd, int cmdSize);
 	void SendStream(uint8_t whichBuffer, uint8_t field, uint32_t bytesToSend, uint32_t cSize);
+#ifdef _WIN32
+	// Blocks until QueryPerformanceCounter reaches targetTicks. Sleep() covers
+	// the bulk of the wait; the last ~2ms are spun against QPC, since Sleep's
+	// ~1-15ms granularity can't hit a sub-millisecond pacing gate on its own.
+	void SleepUntilQpc(int64_t targetTicks);
+#endif
 	void setTimeStart(void);
 	void setTimeEnd(void);
 	uint32_t DiffTime(void);
