@@ -330,6 +330,23 @@ bool TickVideoCapture()
             if (capturedContentSize.Width <= 0 || capturedContentSize.Height <= 0)
                 return false;
 
+            // Pool textures are fixed at the size the pool was built with, so without this
+            // a window grown past its start size stays cropped to it. Recreate keeps the
+            // pool object, so the FrameArrived registration survives.
+            if (capturedContentSize.Width != windowCaptureSize.Width ||
+                capturedContentSize.Height != windowCaptureSize.Height)
+            {
+                windowFrame.Close();
+                windowFrame = nullptr;
+                windowCaptureSize = capturedContentSize;
+                windowFramePool.Recreate(
+                    windowDirect3DDevice,
+                    winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                    2,
+                    windowCaptureSize);
+                return false;
+            }
+
             auto surfaceAccess = windowFrame.Surface().as<
                 Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
             hr = surfaceAccess->GetInterface(
