@@ -154,6 +154,7 @@ MISTERCASTLIB_API bool Initialize(log_function fnLog, capture_image_function fnC
 MISTERCASTLIB_API bool Shutdown()
 {
     stopCapture = true;
+    WakeVideoCapture();
     do {} while (capturing_screen); // wait for threads
     stopCapture = false;
 
@@ -281,6 +282,7 @@ MISTERCASTLIB_API bool SetModeline(
 static bool RestartVideoCapture()
 {
     stopCapture = true;
+    WakeVideoCapture();
     do {} while (capturing_screen); // wait for threads
     stopCapture = false;
 

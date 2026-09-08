@@ -25,6 +25,8 @@
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <mutex>
+#include <condition_variable>
 #include <string.h>
 
 #include <MMDeviceAPI.h>

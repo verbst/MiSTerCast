@@ -29,10 +29,25 @@ winrt::Windows::Graphics::Capture::GraphicsCaptureItem windowCaptureItem{ nullpt
 winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool windowFramePool{ nullptr };
 winrt::Windows::Graphics::Capture::GraphicsCaptureSession windowCaptureSession{ nullptr };
 winrt::Windows::Graphics::SizeInt32 windowCaptureSize = {};
+winrt::event_token         windowFrameToken{};
+std::mutex                 windowFrameMutex;
+std::condition_variable    windowFrameCv;
+// Bumped by FrameArrived and by WakeVideoCapture. The worker samples it before draining
+// and waits for a change, so a signal raised during the drain cannot be missed.
+uint64_t                   windowFrameSignal = 0;
 
-// Windows.Graphics.Capture is the only supported way to capture a single
-// window rather than a whole display; Desktop Duplication has no per-window
-// mode. Requires Windows 10 1903+ (GraphicsCaptureSession::IsSupported()).
+// Also unblocks a worker parked in TickVideoCapture. Call after setting stopCapture, or
+// the callers that spin on capturing_screen wait out the frame timeout.
+void WakeVideoCapture()
+{
+    {
+        std::lock_guard<std::mutex> guard(windowFrameMutex);
+        windowFrameSignal++;
+    }
+    windowFrameCv.notify_all();
+}
+
+// Per-window capture; Desktop Duplication is display-only. Needs Win10 1903+.
 bool InitializeWindowCapture(UINT_PTR windowHandle, IDXGIDevice* dxgiDevice)
 {
     const HWND window = reinterpret_cast<HWND>(windowHandle);
@@ -75,6 +90,10 @@ bool InitializeWindowCapture(UINT_PTR windowHandle, IDXGIDevice* dxgiDevice)
             winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
             2,
             windowCaptureSize);
+
+        // Free-threaded, so this runs on a threadpool thread, not the capture worker.
+        windowFrameToken = windowFramePool.FrameArrived([](auto&&, auto&&) { WakeVideoCapture(); });
+
         windowCaptureSession = windowFramePool.CreateCaptureSession(windowCaptureItem);
         windowCaptureSession.StartCapture();
         activeWindowHandle = windowHandle;
@@ -199,6 +218,9 @@ void CleanupVideoCapture()
 {
     try
     {
+        // Revoke before closing, or a queued FrameArrived can land on a torn-down pool.
+        if (windowFramePool && windowFrameToken.value != 0)
+            windowFramePool.FrameArrived(windowFrameToken);
         if (windowCaptureSession)
             windowCaptureSession.Close();
         if (windowFramePool)
@@ -209,6 +231,7 @@ void CleanupVideoCapture()
         LogMessage("Stopping single-window capture failed: " +
             std::to_string(static_cast<long>(error.code())) + ".", true);
     }
+    windowFrameToken = {};
     windowCaptureSession = nullptr;
     windowFramePool = nullptr;
     windowCaptureItem = nullptr;
@@ -245,6 +268,9 @@ bool TickVideoCapture()
     HRESULT hr;
     ID3D11Texture2D* gpuTex = nullptr;
     winrt::Windows::Graphics::SizeInt32 capturedContentSize = {};
+    // Function scope: the frame owns the surface we copy out of, so it has to outlive the
+    // copy below. Releasing it early hands the surface back to the pool mid-copy.
+    winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame windowFrame{ nullptr };
 
     if (captureWindow)
     {
@@ -272,25 +298,43 @@ bool TickVideoCapture()
 
         try
         {
-            auto frame = windowFramePool.TryGetNextFrame();
-            if (!frame)
+            uint64_t signalSeen;
             {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                std::lock_guard<std::mutex> guard(windowFrameMutex);
+                signalSeen = windowFrameSignal;
+            }
+
+            // TryGetNextFrame returns the oldest queued frame. Take the newest instead:
+            // the stream thread is paced by the modeline and only ever wants the latest.
+            for (;;)
+            {
+                auto next = windowFramePool.TryGetNextFrame();
+                if (!next)
+                    break;
+                if (windowFrame)
+                    windowFrame.Close();
+                windowFrame = next;
+            }
+
+            if (!windowFrame)
+            {
+                // Block like the desktop path's AcquireNextFrame(32). A window with static
+                // content produces no frames, so the timeout doubles as the liveness recheck.
+                std::unique_lock<std::mutex> lock(windowFrameMutex);
+                windowFrameCv.wait_for(lock, std::chrono::milliseconds(32),
+                    [signalSeen] { return windowFrameSignal != signalSeen; });
                 return false;
             }
 
-            capturedContentSize = frame.ContentSize();
+            capturedContentSize = windowFrame.ContentSize();
             if (capturedContentSize.Width <= 0 || capturedContentSize.Height <= 0)
-            {
-                frame.Close();
                 return false;
-            }
-            auto surfaceAccess = frame.Surface().as<
+
+            auto surfaceAccess = windowFrame.Surface().as<
                 Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
             hr = surfaceAccess->GetInterface(
                 __uuidof(ID3D11Texture2D),
                 reinterpret_cast<void**>(&gpuTex));
-            frame.Close();
             EXIT_ON_ERROR(hr, "Getting the single-window capture texture failed");
             windowUnavailableLogged = false;
         }
@@ -507,6 +551,8 @@ bool TickVideoCapture()
 
     cpuTex->Release();
     gpuTex->Release();
+    if (windowFrame)
+        windowFrame.Close();
 
     return ok;
 }
