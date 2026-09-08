@@ -49,4 +49,4 @@ Modelines are validated before use. A mode is refused if its blanking does not e
 Find more modeline examples here: https://www.geocities.ws/podernixie/htpc/modes-en.html
 
 ## Building
-Open `FrontEnd/MiSTerCast.sln` and build the `x64` (or `x86`) configuration. There are no external dependencies to fetch — LZ4 and the Groovy client are vendored in `Library/MiSTerCastLib/` (see its `PROVENANCE.md`).
+Open `FrontEnd/MiSTerCast.sln` and build the `x64` (or `x86`) configuration. There are no external dependencies to fetch — LZ4 and the Groovy client are vendored in `Library/MiSTerCastLib/`.

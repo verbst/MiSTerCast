@@ -179,7 +179,6 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <None Include="cpp.hint" />
-    <None Include="PROVENANCE.md" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="groovymister.h" />
@@ -197,8 +196,7 @@
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="MiSTerCastLib.cpp" />
     <!-- Vendored from Groovy_MiSTer api/ at zero source delta: they do not include
-         pch.h, so the PCH is switched off for them here rather than by editing them.
-         See PROVENANCE.md. -->
+         pch.h, so the PCH is switched off for them here rather than by editing them. -->
     <ClCompile Include="groovymister.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <WarningLevel>Level1</WarningLevel>

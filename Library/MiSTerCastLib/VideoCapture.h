@@ -173,8 +173,7 @@ bool InitializeVideoCapture(int outputNumber, capture_image_function fnCapture)
 
     D3D_FEATURE_LEVEL featureLevel;
     for (size_t i = 0; i < numDriverTypes; i++) {
-        // BGRA_SUPPORT is required for CreateDirect3D11DeviceFromDXGIDevice,
-        // which single-window capture needs; harmless for desktop duplication.
+        // BGRA_SUPPORT: required by CreateDirect3D11DeviceFromDXGIDevice, unused otherwise.
         hr = D3D11CreateDevice(nullptr, driverTypes[i], nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, featureLevels, (UINT)numFeatureLevels,
             D3D11_SDK_VERSION, &d3dDevice, &featureLevel, &d3dDeviceContext);
         if (SUCCEEDED(hr))
@@ -268,9 +267,8 @@ bool TickVideoCapture()
     const bool captureWindow = currentSourceOptions.windowHandle != 0;
     if ((!captureWindow && !desktopDuplication) || (captureWindow && !windowFramePool))
     {
-        // Desktop switches, secure-desktop prompts, and window recreation can
-        // invalidate capture temporarily. Keep the worker alive so it can
-        // recover after the source becomes available again.
+        // A desktop switch, secure-desktop prompt or window recreation invalidates capture.
+        // Rebuild rather than exiting, so the worker recovers when the source comes back.
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         CleanupVideoCapture();
         InitializeVideoCapture(displayIndex, captureFunction);

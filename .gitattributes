@@ -14,9 +14,8 @@
 *.resx             text eol=crlf
 *.settings         text eol=crlf
 
-# Vendored wholesale from Groovy_MiSTer api/ (see
-# Library/MiSTerCastLib/PROVENANCE.md). Held byte-identical to upstream so a
-# re-sync stays a straight file copy and `diff` against upstream stays empty.
+# Vendored from Groovy_MiSTer api/. Kept byte-identical to upstream so a re-sync
+# stays a straight file copy and `diff` against upstream stays empty.
 Library/MiSTerCastLib/groovymister.h    -text
 Library/MiSTerCastLib/groovymister.cpp  -text
 Library/MiSTerCastLib/nlc_codec.h       -text

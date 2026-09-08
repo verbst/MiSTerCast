@@ -39,8 +39,8 @@ std::atomic_bool capturing_screen = false;
 void capture_screen()
 {
     LogMessage("Screen capture starting.");
-    // Single-window capture (Windows.Graphics.Capture) needs a COM apartment
-    // on the calling thread; this worker is a raw std::thread with none.
+    // Raw std::thread, so it has no apartment of its own. The capture session is created
+    // on the caller's thread; this covers the WinRT calls made here.
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
     capturing_screen = true;
     do

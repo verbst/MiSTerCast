@@ -181,6 +181,5 @@ MISTERCASTLIB_API bool SetSource(
     INT16 yoffset,
     UINT8 rotation);
 
-// windowHandle == 0 releases single-window capture and returns to capturing
-// the display set by SetSource. Requires Windows 10 version 1903 or newer.
+// 0 returns to capturing the display set by SetSource. Needs Win10 1903+.
 MISTERCASTLIB_API bool SetCaptureWindow(UINT_PTR windowHandle);
