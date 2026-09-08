@@ -276,6 +276,22 @@ MISTERCASTLIB_API bool SetModeline(
     return true;
 }
 
+// Capture cannot be swapped under the worker, so stop it, swap, then restart. Options are
+// published while it is stopped: publish earlier and the dying worker consumes them instead.
+static bool RestartVideoCapture()
+{
+    stopCapture = true;
+    do {} while (capturing_screen); // wait for threads
+    stopCapture = false;
+
+    captureScreenTask->detach();
+    CleanupVideoCapture();
+    const bool ok = InitializeVideoCapture(source_config.display, captureFunction);
+    SetSourceOptions(&source_config);
+    captureScreenTask = std::make_unique<std::thread>(capture_screen);
+    return ok;
+}
+
 MISTERCASTLIB_API bool SetSource(
     UINT8 display,
     bool audio,
@@ -326,18 +342,9 @@ MISTERCASTLIB_API bool SetSource(
     }
 
     if (displayIndex != source_config.display)
-    {
-        stopCapture = true;
-        do {} while (capturing_screen); // wait for threads
-        stopCapture = false;
-
-        captureScreenTask->detach();
-        CleanupVideoCapture();
-        InitializeVideoCapture(source_config.display, captureFunction);
-        captureScreenTask = std::make_unique<std::thread>(capture_screen);
-    }
-
-    SetSourceOptions(&source_config);
+        RestartVideoCapture();
+    else
+        SetSourceOptions(&source_config);
 
     return true;
 }
@@ -359,22 +366,8 @@ MISTERCASTLIB_API bool SetCaptureWindow(UINT_PTR windowHandle)
 
     source_config.windowHandle = windowHandle;
 
-    // Same inline stop/reinit/restart sequence SetSource already uses when the
-    // display changes: video capture cannot be swapped out from under the
-    // capture thread, so it has to be stopped first.
-    stopCapture = true;
-    do {} while (capturing_screen); // wait for threads
-    stopCapture = false;
-
-    captureScreenTask->detach();
-    CleanupVideoCapture();
-    if (!InitializeVideoCapture(source_config.display, captureFunction))
-    {
+    if (!RestartVideoCapture())
         LogMessage("Failed to initialize the selected video capture source.", true);
-    }
-    captureScreenTask = std::make_unique<std::thread>(capture_screen);
-
-    SetSourceOptions(&source_config);
 
     return true;
 }

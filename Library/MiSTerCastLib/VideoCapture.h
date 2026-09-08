@@ -96,21 +96,20 @@ bool InitializeVideoCapture(int outputNumber, capture_image_function fnCapture)
 {
     displayIndex = outputNumber;
     captureFunction = fnCapture;
-    const UINT_PTR requestedWindowHandle = source_config.windowHandle;
-    currentSourceOptions = {};
-    currentSourceOptions.display = 0;
-    currentSourceOptions.framedelay = 0;
-    currentSourceOptions.alignment = Alignment::Center;
-    currentSourceOptions.audio = 1;
-    currentSourceOptions.syncrefresh = true;
-    currentSourceOptions.cropmode = CropMode::Full43;
 
+    // Defaults are for the first init only. TickVideoCapture re-inits to recover, and
+    // clearing the live options there drops the capture window and zeroes the crop size.
     if (videoCaptures == nullptr)
     {
         videoCaptures = new Bitmap[BUFFER_COUNT];
-        for (int i = 0; i < BUFFER_COUNT; i++)
-            videoCaptures[i] = Bitmap();
+        currentSourceOptions = {};
+        currentSourceOptions.alignment = Alignment::Center;
+        currentSourceOptions.audio = 1;
+        currentSourceOptions.syncrefresh = true;
+        currentSourceOptions.cropmode = CropMode::Full43;
     }
+    const UINT_PTR requestedWindowHandle = source_config.windowHandle;
+    currentSourceOptions.windowHandle = requestedWindowHandle;
 
     HDESK hDesk = OpenInputDesktop(0, FALSE, GENERIC_ALL);
     if (!hDesk)
