@@ -68,7 +68,13 @@ bool InitializeWindowCapture(UINT_PTR windowHandle, IDXGIDevice* dxgiDevice)
         LogMessage("The selected capture window no longer exists.", true);
         return false;
     }
-    if (!winrt::Windows::Graphics::Capture::GraphicsCaptureSession::IsSupported())
+    // Before 1903 the runtime class is not registered and IsSupported throws rather than
+    // returning false, so it needs its own handler. Uncaught it reaches either the P/Invoke
+    // boundary or the capture thread, and terminates.
+    bool supported = false;
+    try { supported = winrt::Windows::Graphics::Capture::GraphicsCaptureSession::IsSupported(); }
+    catch (const winrt::hresult_error&) { }
+    if (!supported)
     {
         LogMessage("Single-window capture requires Windows 10 version 1903 or newer.", true);
         return false;

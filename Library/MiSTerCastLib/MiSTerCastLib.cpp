@@ -40,15 +40,23 @@ void capture_screen()
 {
     LogMessage("Screen capture starting.");
     // Raw std::thread, so it has no apartment of its own. The capture session is created
-    // on the caller's thread; this covers the WinRT calls made here.
-    winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    // on the caller's thread; this covers the WinRT calls made here. Display capture does not
+    // need WinRT at all, so a failure here must not take the thread down with it.
+    bool apartmentReady = false;
+    try
+    {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+        apartmentReady = true;
+    }
+    catch (const winrt::hresult_error&) { }
     capturing_screen = true;
     do
     {
         TickVideoCapture();
     } while (!stopCapture);
     capturing_screen = false;
-    winrt::uninit_apartment();
+    if (apartmentReady)
+        winrt::uninit_apartment();
     LogMessage("Screen capture stopped.");
 }
 
