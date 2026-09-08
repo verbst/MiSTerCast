@@ -11,7 +11,19 @@ struct Bitmap {
 
 SourceOptions source_config = {};
 std::atomic_uint lastVideoCaptureIndex = 0;
+// Buffer the stream thread currently has open, or -1. Published so the capture thread can
+// avoid it; the writer already avoids lastVideoCaptureIndex, and three buffers leave one free.
+std::atomic_int activeReadIndex = -1;
 Bitmap* videoCaptures = nullptr;
+
+// Claims a buffer for the stream thread for as long as it is in scope.
+struct CaptureReadLease
+{
+    explicit CaptureReadLease(unsigned int index) { activeReadIndex.store((int)index); }
+    ~CaptureReadLease() { activeReadIndex.store(-1); }
+    CaptureReadLease(const CaptureReadLease&) = delete;
+    CaptureReadLease& operator=(const CaptureReadLease&) = delete;
+};
 int    displayIndex = 0;
 ID3D11Device*           d3dDevice = nullptr;
 ID3D11DeviceContext*    d3dDeviceContext = nullptr;
@@ -545,7 +557,13 @@ bool TickVideoCapture()
         0, // sub resource
         &sourceRegion);
 
-    unsigned int nextIndex = (lastVideoCaptureIndex + 1) % BUFFER_COUNT;
+    // Skip the published buffer and the one the stream thread has open. Resizing a buffer
+    // it is reading reallocates under it, which Full Source on a dragged window hits often.
+    // Two buffers are excluded at most, so one bump past the published index always lands.
+    const unsigned int publishedIndex = lastVideoCaptureIndex.load();
+    unsigned int nextIndex = (publishedIndex + 1) % BUFFER_COUNT;
+    if ((int)nextIndex == activeReadIndex.load())
+        nextIndex = (nextIndex + 1) % BUFFER_COUNT;
     D3D11_MAPPED_SUBRESOURCE sr;
     hr = d3dDeviceContext->Map(cpuTex, 0, D3D11_MAP_READ, 0, &sr);
     EXIT_ON_ERROR(hr, "D3DDeviceContext->Map failed");

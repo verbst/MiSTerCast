@@ -216,6 +216,7 @@ renderer_nogpu::~renderer_nogpu()
 void renderer_nogpu::nogpu_pack_frame(char* fb)
 {
     const unsigned int drawIndex = lastVideoCaptureIndex;
+    const CaptureReadLease lease(drawIndex); // keeps the capture thread off this buffer
     const Bitmap& capture = videoCaptures[drawIndex];
     const uint8_t* src = capture.buffer.data();
     const int screenwidth = capture.width;
