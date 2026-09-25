@@ -92,11 +92,18 @@ void cast_screen(std::string target, StreamOptions options, SourceOptions source
     LogMessage("[stream] priority=" + std::to_string(GetThreadPriority(GetCurrentThread())) +
         " normalOverride=" + std::to_string(useNormal));
     bool audioStarted = false;
+    bool audioInitAttempted = false;
     try
     {
         if (source.audio && !stopStream)
-            audioStarted = StartAudioCapture();
-        source.audio = audioStarted && audioFormatUsable;
+        {
+            audioInitAttempted = true;
+            if (InitAudioCapture())
+                audioStarted = StartAudioCapture();
+            if (!audioStarted)
+                LogMessage("Audio capture unavailable; streaming without audio.", true);
+        }
+        source.audio = audioStarted;
         if (!stopStream)
         {
             LogMessage("Casting to MiSTer starting.");
@@ -120,6 +127,8 @@ void cast_screen(std::string target, StreamOptions options, SourceOptions source
         ReportAudioCapture(true);
     }
     audioBuffer = nullptr;
+    if (audioInitAttempted)
+        CleanupAudioCapture();
     LogMessage("Casting to MiSTer stopped.");
 }
 
@@ -189,14 +198,6 @@ MISTERCASTLIB_API bool Initialize(log_function fnLog, capture_image_function fnC
         return false;
     }
 
-    if (!InitAudioCapture())
-    {
-        LogMessage("Failed to initialize audio capture.", true);
-        CleanupAudioCapture();
-        CleanupVideoCapture();
-        return false;
-    }
-
     // Fill the buffers to be safe
     for (int i = 0; i < BUFFER_COUNT; i++)
         TickVideoCapture();
@@ -215,7 +216,6 @@ MISTERCASTLIB_API bool Shutdown()
     std::lock_guard<std::mutex> guard(lifecycleMutex);
     JoinWorker(castScreenTask, stopStream, false);
     JoinWorker(captureScreenTask, stopCapture, true);
-    CleanupAudioCapture();
     CleanupVideoCapture();
     delete[] videoCaptures;
     videoCaptures = nullptr;
