@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Windows;
@@ -365,6 +365,8 @@ namespace MiSTerCast
 
         private void StreamOption_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
+            if (LogLevelComboBox != null)
+                currentLogLevel = LogLevelComboBox.SelectedIndex;
             OnStreamOptionsChanged();
         }
 
@@ -645,6 +647,7 @@ namespace MiSTerCast
 
         #region Logs
 
+        private volatile int currentLogLevel = 0;
         private MiSTerCastInterop.LogDelegate LogDelegate;
         private StreamWriter logFile;
         private bool logFileTried = false;
@@ -682,25 +685,32 @@ namespace MiSTerCast
         {
             // Called from the library's capture and stream threads as well as the UI thread.
             // Nothing in here may throw: an exception on those threads takes the process down.
+
+            if (currentLogLevel == 0 && !error)
+                return;
+
             string opened = null;
-            lock (logFileLock)
+            if (currentLogLevel > 0)
             {
-                if (!logFileTried)
+                lock (logFileLock)
                 {
-                    logFileTried = true;
-                    logFile = OpenLogFile(out opened);
-                }
-                if (logFile != null)
-                {
-                    try
+                    if (!logFileTried)
                     {
-                        if (opened != null)
-                            logFile.WriteLine("Log file: " + opened);
-                        logFile.WriteLine(DateTime.Now.ToString("HH:mm:ss.fff") + (error ? " ! " : "   ") + message);
+                        logFileTried = true;
+                        logFile = OpenLogFile(out opened);
                     }
-                    catch (Exception)
+                    if (logFile != null)
                     {
-                        logFile = null; // disk full or device gone; stop trying
+                        try
+                        {
+                            if (opened != null)
+                                logFile.WriteLine("Log file: " + opened);
+                            logFile.WriteLine(DateTime.Now.ToString("HH:mm:ss.fff") + (error ? " ! " : "   ") + message);
+                        }
+                        catch (Exception)
+                        {
+                            logFile = null; // disk full or device gone; stop trying
+                        }
                     }
                 }
             }

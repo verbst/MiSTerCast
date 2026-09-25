@@ -1,3 +1,13 @@
+<Bold>MiSTerCast 1.05</Bold>
+
+Added in window only send (thanks to EIFDA for your contribution! <Hyperlink>https://github.com/ElFDA</Hyperlink>)
+Fixed audio send threading and pacing issues.
+Added 2 new 480p modelines.
+Other bug fixes.
+
+This version requires an updated set of Groovy_MiSTer NLC files are required to be deployed on your MiSTer.
+<Hyperlink>https://github.com/verbst/Groovy_MiSTer</Hyperlink>
+
 <Bold>MiSTerCast 1.04</Bold>
 
 Updated reconnection code to be more reliable and to remove post-connect graphical issue.
