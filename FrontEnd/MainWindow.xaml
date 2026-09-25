@@ -5,7 +5,7 @@
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:local="clr-namespace:MiSTerCast"
         mc:Ignorable="d"
-        Title="MiSTerCast 1.04" Height="760" Width="680"
+        Title="MiSTerCast 1.04" Height="790" Width="680"
         Activated="Window_Activated"
         Closing="MainWindow_Closing"
         Closed="Window_Closed">
@@ -46,6 +46,12 @@
             </GroupBox>
             <GroupBox Header="Stream" Grid.Row="1">
                 <StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="20,4,20,0">
+                        <Label Target="{Binding ElementName=AudioBufferTextBox}">Audio buffer (ms)</Label>
+                        <TextBox x:Name="AudioBufferTextBox" Width="55" Margin="4,2" Text="40"
+                                 TextChanged="AudioBuffer_TextChanged"
+                                 ToolTip="0–200 ms total. Higher values add capture margin and MiSTer send-ahead, but delay audio. Low values may underrun. Applies on the next Start Stream; saved with Save Settings."/>
+                    </StackPanel>
                     <Grid Margin="10,1,10,1">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="*"/>
@@ -385,4 +391,3 @@
         </Grid>
     </Border>
 </Window>
-    

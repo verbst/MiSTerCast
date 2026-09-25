@@ -48,6 +48,7 @@
 
 #include <d3d11.h>
 #include <dxgi1_2.h>
+#include <d2d1_1.h>
 #include <windows.graphics.capture.interop.h>
 #include <windows.graphics.directx.direct3d11.interop.h>
 #include <winrt/Windows.Foundation.h>

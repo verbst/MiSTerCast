@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "MiSTerCastLib.h"
+#include "Diagnostics.h"
 #include "AudioCapture.h"
 #include "VideoCapture.h"
 
@@ -7,10 +8,16 @@
 #pragma comment(lib, "Winmm.lib")
 
 log_function logFunction = nullptr;
+thread_local uint64_t diagnosticSession = 0;
 void LogMessage(std::string message, bool error)
 {
     if (logFunction != nullptr)
-        logFunction(message.c_str(), error);
+    {
+        const std::string tagged = "[pid=" + std::to_string(GetCurrentProcessId()) +
+            " tid=" + std::to_string(GetCurrentThreadId()) +
+            " session=" + std::to_string(diagnosticSession) + "] " + message;
+        logFunction(tagged.c_str(), error);
+    }
 }
 
 std::atomic_bool stopCapture = false;
@@ -35,9 +42,9 @@ static void GroovyLogSink(const char* message)
         LogMessage(text);
 }
 
-std::atomic_bool capturing_screen = false;
 void capture_screen()
 {
+    WorkerDiagnostics diagnostics("capture", true);
     LogMessage("Screen capture starting.");
     // Raw std::thread, so it has no apartment of its own. The capture session is created
     // on the caller's thread; this covers the WinRT calls made here. Display capture does not
@@ -49,56 +56,92 @@ void capture_screen()
         apartmentReady = true;
     }
     catch (const winrt::hresult_error&) { }
-    capturing_screen = true;
-    do
+    try
     {
-        TickVideoCapture();
-    } while (!stopCapture);
-    capturing_screen = false;
+        while (!stopCapture)
+        {
+            TickVideoCapture();
+            diagnostics.report();
+        }
+    }
+    catch (const std::exception& error)
+    {
+        LogMessage(std::string("Capture worker failed: ") + error.what(), true);
+    }
+    catch (const winrt::hresult_error& error)
+    {
+        LogMessage("Capture worker failed: " + std::to_string(static_cast<long>(error.code())), true);
+    }
     if (apartmentReady)
         winrt::uninit_apartment();
     LogMessage("Screen capture stopped.");
 }
 
-std::atomic_bool casting_screen = false;
-void cast_screen()
+void cast_screen(std::string target, StreamOptions options, SourceOptions source, uint64_t session)
 {
-    if (!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST))
+    diagnosticSession = session;
+    WorkerDiagnostics diagnostics("stream", false);
+    char normalPriority[2] = {};
+    const bool useNormal = GetEnvironmentVariableA("MISTERCAST_DIAG_NORMAL_PRIORITY", normalPriority,
+        sizeof(normalPriority)) == 1 && normalPriority[0] == '1';
+    if (!SetThreadPriority(GetCurrentThread(), useNormal ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_HIGHEST))
     {
         LogMessage("Setting cast screen thread priority failed: " + std::to_string(GetLastError()), true);
     }
 
-    if (source_config.audio)
+    LogMessage("[stream] priority=" + std::to_string(GetThreadPriority(GetCurrentThread())) +
+        " normalOverride=" + std::to_string(useNormal));
+    bool audioStarted = false;
+    try
     {
-        LogMessage("Audio capture starting.");
-        StartAudioCapture();
-    }
-
-    LogMessage("Casting to MiSTer starting.");
-    casting_screen = true;
-    {
-        auto renderer = std::make_unique<renderer_nogpu>(targetIpString);
+        if (source.audio && !stopStream)
+            audioStarted = StartAudioCapture();
+        source.audio = audioStarted && audioFormatUsable;
+        if (!stopStream)
         {
-            do
+            LogMessage("Casting to MiSTer starting.");
+            auto renderer = std::make_unique<renderer_nogpu>(target, options, source);
+            while (!stopStream)
             {
                 renderer->draw();
-            } while (!stopStream);
+                diagnostics.report();
+                if (audioStarted)
+                    ReportAudioCapture();
+            }
         }
     }
-    casting_screen = false;
-    LogMessage("Casting to MiSTer stopped.");
-
-    if (source_config.audio)
+    catch (const std::exception& error)
+    {
+        LogMessage(std::string("Stream worker failed: ") + error.what(), true);
+    }
+    if (audioStarted)
     {
         StopAudioCapture();
-        LogMessage("Audio capture stopped.");
+        ReportAudioCapture(true);
     }
+    audioBuffer = nullptr;
+    LogMessage("Casting to MiSTer stopped.");
 }
 
 bool initialized = false;
+std::mutex lifecycleMutex;
 std::unique_ptr<std::thread> captureScreenTask;
+std::unique_ptr<std::thread> castScreenTask;
+uint64_t streamSession = 0;
+
+static void JoinWorker(std::unique_ptr<std::thread>& worker, std::atomic_bool& stop, bool capture)
+{
+    stop = true;
+    if (capture)
+        WakeVideoCapture();
+    if (worker && worker->joinable())
+        worker->join();
+    worker.reset();
+}
+
 MISTERCASTLIB_API bool Initialize(log_function fnLog, capture_image_function fnCapture)
 {
+    std::lock_guard<std::mutex> guard(lifecycleMutex);
     if (initialized)
     {
         LogMessage("MiSTerCast is already initialized.", true);
@@ -108,6 +151,7 @@ MISTERCASTLIB_API bool Initialize(log_function fnLog, capture_image_function fnC
     logFunction = fnLog;
     gm_set_log_sink(GroovyLogSink);
     LogMessage("Initializing MiSTerCast");
+    LogMessage("[build] native " __DATE__ " " __TIME__ " pointerBits=" + std::to_string(sizeof(void*) * 8));
 
     source_config.syncrefresh = true;
     source_config.framedelay = 0;
@@ -121,6 +165,7 @@ MISTERCASTLIB_API bool Initialize(log_function fnLog, capture_image_function fnC
     stream_config.mtu = 1500;
     stream_config.autoReconnect = true;
     stream_config.verbose = 0;
+    stream_config.audioBufferMs = 40;
     stream_config.allowOversizeModes = false;
 
     selected_modeline.pclock = 6.700;
@@ -133,17 +178,22 @@ MISTERCASTLIB_API bool Initialize(log_function fnLog, capture_image_function fnC
     selected_modeline.vend = 247;
     selected_modeline.vtotal = 262;
     selected_modeline.interlace = 0;
+    captureOutputWidth = selected_modeline.hactive;
+    captureOutputHeight = selected_modeline.vactive;
     
 
     if (!InitializeVideoCapture(0, fnCapture))
     {
         LogMessage("Failed to initialize video capture.", true);
+        CleanupVideoCapture();
         return false;
     }
 
     if (!InitAudioCapture())
     {
         LogMessage("Failed to initialize audio capture.", true);
+        CleanupAudioCapture();
+        CleanupVideoCapture();
         return false;
     }
 
@@ -151,6 +201,7 @@ MISTERCASTLIB_API bool Initialize(log_function fnLog, capture_image_function fnC
     for (int i = 0; i < BUFFER_COUNT; i++)
         TickVideoCapture();
 
+    stopCapture = false;
     captureScreenTask = std::make_unique<std::thread>(capture_screen);
 
     LogMessage("MiSTerCast ready.");
@@ -161,34 +212,43 @@ MISTERCASTLIB_API bool Initialize(log_function fnLog, capture_image_function fnC
 
 MISTERCASTLIB_API bool Shutdown()
 {
-    stopCapture = true;
-    WakeVideoCapture();
-    do {} while (capturing_screen); // wait for threads
-    stopCapture = false;
-
-    captureScreenTask->detach();
-
+    std::lock_guard<std::mutex> guard(lifecycleMutex);
+    JoinWorker(castScreenTask, stopStream, false);
+    JoinWorker(captureScreenTask, stopCapture, true);
+    CleanupAudioCapture();
+    CleanupVideoCapture();
+    delete[] videoCaptures;
+    videoCaptures = nullptr;
+    lastVideoCaptureIndex = 0;
+    initialized = false;
+    LogMessage("Shutdown complete; both workers joined.");
     return true;
 }
 
-std::unique_ptr<std::thread> castScreenTask;
-
 MISTERCASTLIB_API bool StartStream(const char* targetIp)
 {
+    std::lock_guard<std::mutex> guard(lifecycleMutex);
+    if (!initialized || castScreenTask || !targetIp || !*targetIp)
+    {
+        LogMessage("Start rejected: not initialized, already started, or empty target.", true);
+        return false;
+    }
+    if (ValidateModelineFor(selected_modeline, stream_config.rgbMode, stream_config.allowOversizeModes) != ModelineOk)
+        return false;
     LogMessage("Starting stream.");
     targetIpString = std::string(targetIp);
-    castScreenTask = std::make_unique<std::thread>(cast_screen);
+    stopStream = false;
+    castScreenTask = std::make_unique<std::thread>(cast_screen, targetIpString,
+        stream_config, source_config, ++streamSession);
 
     return true;
 }
 
 MISTERCASTLIB_API bool StopStream()
 {
-    stopStream = true;
-    do {} while (casting_screen); // wait for threads
-    stopStream = false;
-
-    castScreenTask->detach();
+    std::lock_guard<std::mutex> guard(lifecycleMutex);
+    JoinWorker(castScreenTask, stopStream, false);
+    LogMessage("Stop complete; stream worker joined.");
     return true;
 }
 
@@ -202,6 +262,7 @@ MISTERCASTLIB_API bool SetStreamOptions(
     UINT8 verbose,
     bool allowOversizeModes)
 {
+    std::lock_guard<std::mutex> guard(lifecycleMutex);
     stream_config.codec = codec;
     stream_config.nlcPack = (nlcPack == NlcPackRice) ? NlcPackRice : NlcPackTiled;
     stream_config.nearLevel = (nearLevel > 3) ? 3 : nearLevel;
@@ -210,7 +271,18 @@ MISTERCASTLIB_API bool SetStreamOptions(
     stream_config.autoReconnect = autoReconnect;
     stream_config.verbose = verbose;
     stream_config.allowOversizeModes = allowOversizeModes;
+    captureLogLevel = verbose;
+    diagnosticLogLevel = verbose;
 
+    return true;
+}
+
+MISTERCASTLIB_API bool SetAudioBufferMs(UINT16 milliseconds)
+{
+    std::lock_guard<std::mutex> guard(lifecycleMutex);
+    if (milliseconds > 200)
+        return false;
+    stream_config.audioBufferMs = milliseconds;
     return true;
 }
 
@@ -255,6 +327,7 @@ MISTERCASTLIB_API bool SetModeline(
     UINT16 vtotal,
     bool interlace)
 {
+    std::lock_guard<std::mutex> guard(lifecycleMutex);
     LogMessage("SetModeline called");
 
     nogpu_modeline candidate = {};
@@ -279,8 +352,13 @@ MISTERCASTLIB_API bool SetModeline(
         return false;
     }
 
-    selected_modeline = candidate;
-    shouldUpdateVideoMode = true;
+    {
+        std::lock_guard<std::mutex> modeGuard(modelineMutex);
+        selected_modeline = candidate;
+        ++modelineRevision;
+    }
+    captureOutputWidth = candidate.hactive;
+    captureOutputHeight = candidate.vactive;
 
     return true;
 }
@@ -289,15 +367,11 @@ MISTERCASTLIB_API bool SetModeline(
 // published while it is stopped: publish earlier and the dying worker consumes them instead.
 static bool RestartVideoCapture()
 {
-    stopCapture = true;
-    WakeVideoCapture();
-    do {} while (capturing_screen); // wait for threads
-    stopCapture = false;
-
-    captureScreenTask->detach();
+    JoinWorker(captureScreenTask, stopCapture, true);
     CleanupVideoCapture();
     const bool ok = InitializeVideoCapture(source_config.display, captureFunction);
     SetSourceOptions(&source_config);
+    stopCapture = false;
     captureScreenTask = std::make_unique<std::thread>(capture_screen);
     return ok;
 }
@@ -314,6 +388,7 @@ MISTERCASTLIB_API bool SetSource(
     INT16 yoffset,
     UINT8 rotation)
 {
+    std::lock_guard<std::mutex> guard(lifecycleMutex);
     source_config.display = display;
     source_config.audio = audio;
     source_config.preview = preview;
@@ -361,6 +436,7 @@ MISTERCASTLIB_API bool SetSource(
 
 MISTERCASTLIB_API bool SetCaptureWindow(UINT_PTR windowHandle)
 {
+    std::lock_guard<std::mutex> guard(lifecycleMutex);
     if (!initialized)
     {
         LogMessage("MiSTerCast must be initialized before selecting a capture window.", true);

@@ -2,6 +2,42 @@
 
 #define BUFFER_COUNT 3
 
+// avg/max over one reporting window; reset after each report
+struct TimingStat
+{
+    double sumMs = 0;
+    double maxMs = 0;
+    unsigned count = 0;
+    void add(double ms) { sumMs += ms; if (ms > maxMs) maxMs = ms; count++; }
+    double avg() const { return count ? sumMs / count : 0; }
+    void reset() { sumMs = 0; maxMs = 0; count = 0; }
+};
+
+inline double MsSince(std::chrono::steady_clock::time_point t)
+{
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+}
+
+// Capture-thread telemetry. Reported at log level 1 every 2s, then reset.
+std::atomic_int captureLogLevel = 0;
+struct
+{
+    std::chrono::steady_clock::time_point windowStart;
+    unsigned ticks = 0;     // TickVideoCapture calls
+    unsigned frames = 0;    // ticks that published a frame
+    unsigned drained = 0;   // window frames discarded by newest-wins
+    unsigned waits = 0;     // ticks that timed out with no frame
+    TimingStat tick;        // whole tick, frames only
+    TimingStat readback;    // CreateTexture2D + copy + Map
+    TimingStat copy;        // memcpy into the triple buffer
+    TimingStat preview;     // preview callback into the front end
+    void reset()
+    {
+        windowStart = std::chrono::steady_clock::now();
+        ticks = frames = drained = waits = 0;
+        tick.reset(); readback.reset(); copy.reset(); preview.reset();
+    }
+} captureStats;
 
 struct Bitmap {
     int                  width = 0;
@@ -28,6 +64,68 @@ int    displayIndex = 0;
 ID3D11Device*           d3dDevice = nullptr;
 ID3D11DeviceContext*    d3dDeviceContext = nullptr;
 IDXGIOutputDuplication* desktopDuplication = nullptr;
+
+// The crop is scaled and rotated on the GPU into a modeline-sized target, so the readback and
+// everything after it cost the same whether the source is a 1X crop or a 4K window. Set from
+// the modeline; the capture side never needs to know about fields.
+std::atomic_uint        captureOutputWidth = 0;
+std::atomic_uint        captureOutputHeight = 0;
+ID2D1Factory1*          d2dFactory = nullptr;
+ID2D1Device*            d2dDevice = nullptr;
+ID2D1DeviceContext*     d2dContext = nullptr;
+ID3D11Texture2D*        scaleTarget = nullptr;        // render target the crop is drawn into
+ID2D1Bitmap1*           scaleTargetBitmap = nullptr;
+ID3D11Texture2D*        scaleStaging = nullptr;       // CPU-readable copy of scaleTarget
+unsigned int            scaleTargetWidth = 0;
+unsigned int            scaleTargetHeight = 0;
+
+void ReleaseScaleTargets()
+{
+    SAFE_RELEASE(scaleTargetBitmap);
+    SAFE_RELEASE(scaleTarget);
+    SAFE_RELEASE(scaleStaging);
+    scaleTargetWidth = scaleTargetHeight = 0;
+}
+
+// Allocates the output pair once per size; a mode change recreates it.
+bool EnsureScaleTargets(unsigned int width, unsigned int height)
+{
+    if (scaleTarget && scaleTargetWidth == width && scaleTargetHeight == height)
+        return true;
+    ReleaseScaleTargets();
+
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    HRESULT hr = d3dDevice->CreateTexture2D(&desc, nullptr, &scaleTarget);
+    EXIT_ON_ERROR(hr, "CreateTexture2D for the scale target failed");
+
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    hr = d3dDevice->CreateTexture2D(&desc, nullptr, &scaleStaging);
+    EXIT_ON_ERROR(hr, "CreateTexture2D for the scale staging texture failed");
+
+    IDXGISurface* surface = nullptr;
+    hr = scaleTarget->QueryInterface(__uuidof(IDXGISurface), reinterpret_cast<void**>(&surface));
+    EXIT_ON_ERROR(hr, "QueryInterface IDXGISurface on the scale target failed");
+    const D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
+        D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
+    hr = d2dContext->CreateBitmapFromDxgiSurface(surface, &props, &scaleTargetBitmap);
+    surface->Release();
+    EXIT_ON_ERROR(hr, "CreateBitmapFromDxgiSurface for the scale target failed");
+
+    scaleTargetWidth = width;
+    scaleTargetHeight = height;
+    return true;
+}
 bool                    haveFrameLock = false;
 capture_image_function  captureFunction;
 std::atomic_bool        hasNewSourceOptions;
@@ -147,6 +245,7 @@ bool InitializeVideoCapture(int outputNumber, capture_image_function fnCapture)
     }
     const UINT_PTR requestedWindowHandle = source_config.windowHandle;
     currentSourceOptions.windowHandle = requestedWindowHandle;
+    captureStats.reset();
 
     HDESK hDesk = OpenInputDesktop(0, FALSE, GENERIC_ALL);
     if (!hDesk)
@@ -179,7 +278,7 @@ bool InitializeVideoCapture(int outputNumber, capture_image_function fnCapture)
 
     D3D_FEATURE_LEVEL featureLevel;
     for (size_t i = 0; i < numDriverTypes; i++) {
-        // BGRA_SUPPORT: required by CreateDirect3D11DeviceFromDXGIDevice, unused otherwise.
+        // BGRA_SUPPORT: required by Direct2D interop and CreateDirect3D11DeviceFromDXGIDevice.
         hr = D3D11CreateDevice(nullptr, driverTypes[i], nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, featureLevels, (UINT)numFeatureLevels,
             D3D11_SDK_VERSION, &d3dDevice, &featureLevel, &d3dDeviceContext);
         if (SUCCEEDED(hr))
@@ -191,6 +290,16 @@ bool InitializeVideoCapture(int outputNumber, capture_image_function fnCapture)
     IDXGIDevice* dxgiDevice = nullptr;
     hr = d3dDevice->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDevice);
     EXIT_ON_ERROR(hr, "D3DDevice->QueryInterface failed");
+
+    // Direct2D on the same device does the crop/scale/rotate. Only the capture thread uses
+    // the context once it exists; BGRA_SUPPORT above is what D2D interop requires.
+    hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED, __uuidof(ID2D1Factory1), nullptr,
+        reinterpret_cast<void**>(&d2dFactory));
+    EXIT_ON_ERROR(hr, "D2D1CreateFactory failed");
+    hr = d2dFactory->CreateDevice(dxgiDevice, &d2dDevice);
+    EXIT_ON_ERROR(hr, "ID2D1Factory1->CreateDevice failed");
+    hr = d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &d2dContext);
+    EXIT_ON_ERROR(hr, "ID2D1Device->CreateDeviceContext failed");
 
     if (requestedWindowHandle != 0)
     {
@@ -256,6 +365,10 @@ void CleanupVideoCapture()
     windowCaptureSize = {};
     activeWindowHandle = 0;
     windowUnavailableLogged = false;
+    ReleaseScaleTargets();
+    SAFE_RELEASE(d2dContext);
+    SAFE_RELEASE(d2dDevice);
+    SAFE_RELEASE(d2dFactory);
     SAFE_RELEASE(desktopDuplication);
     SAFE_RELEASE(d3dDeviceContext);
     SAFE_RELEASE(d3dDevice);
@@ -280,6 +393,25 @@ bool TickVideoCapture()
         InitializeVideoCapture(displayIndex, captureFunction);
         return false;
     }
+
+    // Reported here rather than after a frame, so a stalled source still shows up.
+    if (captureLogLevel.load() >= 1 && MsSince(captureStats.windowStart) >= 2000)
+    {
+        const Bitmap& last = videoCaptures[lastVideoCaptureIndex];
+        char line[256];
+        snprintf(line, sizeof(line),
+            "[capture] %dx%d ticks=%u frames=%u drained=%u waits=%u | tick %.1f/%.1fms readback %.1f/%.1f copy %.1f/%.1f preview %.1f/%.1f",
+            last.width, last.height,
+            captureStats.ticks, captureStats.frames, captureStats.drained, captureStats.waits,
+            captureStats.tick.avg(), captureStats.tick.maxMs,
+            captureStats.readback.avg(), captureStats.readback.maxMs,
+            captureStats.copy.avg(), captureStats.copy.maxMs,
+            captureStats.preview.avg(), captureStats.preview.maxMs);
+        LogMessage(line);
+        captureStats.reset();
+    }
+    captureStats.ticks++;
+    const auto tickStart = std::chrono::steady_clock::now();
 
     HRESULT hr;
     ID3D11Texture2D* gpuTex = nullptr;
@@ -328,7 +460,10 @@ bool TickVideoCapture()
                 if (!next)
                     break;
                 if (windowFrame)
+                {
                     windowFrame.Close();
+                    captureStats.drained++;
+                }
                 windowFrame = next;
             }
 
@@ -336,6 +471,7 @@ bool TickVideoCapture()
             {
                 // Block like the desktop path's AcquireNextFrame(32). A window with static
                 // content produces no frames, so the timeout doubles as the liveness recheck.
+                captureStats.waits++;
                 std::unique_lock<std::mutex> lock(windowFrameMutex);
                 windowFrameCv.wait_for(lock, std::chrono::milliseconds(32),
                     [signalSeen] { return windowFrameSignal != signalSeen; });
@@ -393,7 +529,10 @@ bool TickVideoCapture()
         DXGI_OUTDUPL_FRAME_INFO frameInfo = {};
         hr = desktopDuplication->AcquireNextFrame(32, &frameInfo, &deskRes);
         if (hr == DXGI_ERROR_WAIT_TIMEOUT)
+        {
+            captureStats.waits++;
             return false;
+        }
 
         if (FAILED(hr))
         {
@@ -436,10 +575,6 @@ bool TickVideoCapture()
     const unsigned int sourceHeight = captureWindow
         ? (std::min)(desc.Height, static_cast<unsigned int>(capturedContentSize.Height))
         : desc.Height;
-    desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE | D3D11_CPU_ACCESS_READ;
-    desc.Usage = D3D11_USAGE_STAGING;
-    desc.BindFlags = 0;
-    desc.MiscFlags = 0;
 
     switch (currentSourceOptions.cropmode)
     {
@@ -536,62 +671,129 @@ bool TickVideoCapture()
     else if (yoffset + height > sourceHeight)
         yoffset = sourceHeight - height;
 
-    desc.Width = width;
-    desc.Height = height;
+    // Output is the modeline's active area; before one is set, the crop size keeps the
+    // preview working.
+    unsigned int outWidth = captureOutputWidth.load();
+    unsigned int outHeight = captureOutputHeight.load();
+    if (outWidth == 0 || outHeight == 0)
+    {
+        outWidth = width;
+        outHeight = height;
+    }
 
-    ID3D11Texture2D* cpuTex = nullptr;
-    hr = d3dDevice->CreateTexture2D(&desc, nullptr, &cpuTex);
-    EXIT_ON_ERROR(hr, "D3DDevice->CreateTexture2D failed");
+    ID2D1Bitmap1* sourceBitmap = nullptr;
+    auto fail = [&](const char* message) -> bool
+    {
+        LogMessage(std::string(message) + ": " + std::to_string(hr), true);
+        SAFE_RELEASE(sourceBitmap);
+        gpuTex->Release();
+        return false;
+    };
 
-    D3D11_BOX sourceRegion;
-    sourceRegion.left = xoffset;
-    sourceRegion.right = xoffset + width;
-    sourceRegion.top = yoffset;
-    sourceRegion.bottom = yoffset + height;
-    sourceRegion.front = 0;
-    sourceRegion.back = 1;
+    if (!EnsureScaleTargets(outWidth, outHeight))
+    {
+        gpuTex->Release();
+        return false;
+    }
 
-    d3dDeviceContext->CopySubresourceRegion(
-        cpuTex,
-        0, // sub resource
-        0, //x
-        0, //y
-        0, //z
-        gpuTex,
-        0, // sub resource
-        &sourceRegion);
+    const auto readbackStart = std::chrono::steady_clock::now();
+
+    // Wrap the capture texture for D2D; this is a view, not a copy.
+    IDXGISurface* sourceSurface = nullptr;
+    hr = gpuTex->QueryInterface(__uuidof(IDXGISurface), reinterpret_cast<void**>(&sourceSurface));
+    if (FAILED(hr))
+        return fail("QueryInterface IDXGISurface on the capture texture failed");
+    const D2D1_BITMAP_PROPERTIES1 sourceProps = D2D1::BitmapProperties1(
+        D2D1_BITMAP_OPTIONS_NONE,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
+    hr = d2dContext->CreateBitmapFromDxgiSurface(sourceSurface, &sourceProps, &sourceBitmap);
+    sourceSurface->Release();
+    if (FAILED(hr))
+        return fail("CreateBitmapFromDxgiSurface on the capture texture failed");
+
+    // Rotation names describe the monitor, so the image turns the other way. For the 90
+    // degree cases the unrotated destination is outHeight x outWidth about the centre; the
+    // rotation then lands it on the full output.
+    const D2D1_RECT_F sourceRect = D2D1::RectF(
+        (float)xoffset, (float)yoffset, (float)(xoffset + width), (float)(yoffset + height));
+    const D2D1_POINT_2F centre = D2D1::Point2F(outWidth / 2.0f, outHeight / 2.0f);
+    const D2D1_RECT_F transposedRect = D2D1::RectF(
+        centre.x - outHeight / 2.0f, centre.y - outWidth / 2.0f,
+        centre.x + outHeight / 2.0f, centre.y + outWidth / 2.0f);
+    D2D1_RECT_F destRect = D2D1::RectF(0.0f, 0.0f, (float)outWidth, (float)outHeight);
+    D2D1_MATRIX_3X2_F transform = D2D1::Matrix3x2F::Identity();
+    switch (source_config.rotation)
+    {
+    case Rotation::CW90:
+        destRect = transposedRect;
+        transform = D2D1::Matrix3x2F::Rotation(-90.0f, centre);
+        break;
+    case Rotation::CCW90:
+        destRect = transposedRect;
+        transform = D2D1::Matrix3x2F::Rotation(90.0f, centre);
+        break;
+    case Rotation::Flip180:
+        transform = D2D1::Matrix3x2F::Rotation(180.0f, centre);
+        break;
+    default:
+        break;
+    }
+
+    d2dContext->SetTarget(scaleTargetBitmap);
+    d2dContext->BeginDraw();
+    d2dContext->SetTransform(transform);
+    d2dContext->DrawBitmap(sourceBitmap, &destRect, 1.0f,
+        D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &sourceRect);
+    d2dContext->SetTransform(D2D1::Matrix3x2F::Identity());
+    hr = d2dContext->EndDraw();
+    d2dContext->SetTarget(nullptr);
+    if (FAILED(hr))
+        return fail("Direct2D EndDraw failed");
+    SAFE_RELEASE(sourceBitmap);
+
+    d3dDeviceContext->CopyResource(scaleStaging, scaleTarget);
 
     // Skip the published buffer and the one the stream thread has open. Resizing a buffer
-    // it is reading reallocates under it, which Full Source on a dragged window hits often.
-    // Two buffers are excluded at most, so one bump past the published index always lands.
+    // it is reading reallocates under it. Two buffers are excluded at most, so one bump past
+    // the published index always lands.
     const unsigned int publishedIndex = lastVideoCaptureIndex.load();
     unsigned int nextIndex = (publishedIndex + 1) % BUFFER_COUNT;
     if ((int)nextIndex == activeReadIndex.load())
         nextIndex = (nextIndex + 1) % BUFFER_COUNT;
     D3D11_MAPPED_SUBRESOURCE sr;
-    hr = d3dDeviceContext->Map(cpuTex, 0, D3D11_MAP_READ, 0, &sr);
-    EXIT_ON_ERROR(hr, "D3DDeviceContext->Map failed");
+    hr = d3dDeviceContext->Map(scaleStaging, 0, D3D11_MAP_READ, 0, &sr);
+    if (FAILED(hr))
+        return fail("D3DDeviceContext->Map failed");
+    captureStats.readback.add(MsSince(readbackStart));
 
-    if (videoCaptures[nextIndex].width != width || videoCaptures[nextIndex].height != height)
+    if (videoCaptures[nextIndex].width != (int)outWidth || videoCaptures[nextIndex].height != (int)outHeight)
     {
-        videoCaptures[nextIndex].width = width;
-        videoCaptures[nextIndex].height = height;
-        videoCaptures[nextIndex].buffer.resize(width * height * 4);
+        videoCaptures[nextIndex].width = (int)outWidth;
+        videoCaptures[nextIndex].height = (int)outHeight;
+        videoCaptures[nextIndex].buffer.resize((size_t)outWidth * outHeight * 4);
     }
 
-    for (int y = 0; y < (int)height; y++) // TODO: Can this be improved?
-        memcpy(videoCaptures[nextIndex].buffer.data() + y * width * 4, (uint8_t*)sr.pData + sr.RowPitch * y, width * 4);
-    d3dDeviceContext->Unmap(cpuTex, 0);
+    const auto copyStart = std::chrono::steady_clock::now();
+    for (unsigned int y = 0; y < outHeight; y++)
+        memcpy(videoCaptures[nextIndex].buffer.data() + (size_t)y * outWidth * 4, (uint8_t*)sr.pData + (size_t)sr.RowPitch * y, (size_t)outWidth * 4);
+    d3dDeviceContext->Unmap(scaleStaging, 0);
+    captureStats.copy.add(MsSince(copyStart));
 
     if (currentSourceOptions.preview)
-        captureFunction(width, height, videoCaptures[nextIndex].buffer.data());
+    {
+        const auto previewStart = std::chrono::steady_clock::now();
+        captureFunction((int)outWidth, (int)outHeight, videoCaptures[nextIndex].buffer.data());
+        captureStats.preview.add(MsSince(previewStart));
+    }
 
     lastVideoCaptureIndex = nextIndex;
 
-    cpuTex->Release();
     gpuTex->Release();
     if (windowFrame)
         windowFrame.Close();
+
+    captureStats.frames++;
+    captureStats.tick.add(MsSince(tickStart));
 
     return ok;
 }

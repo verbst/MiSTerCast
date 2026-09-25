@@ -84,6 +84,10 @@ namespace MiSTerCast
         [return: MarshalAs(UnmanagedType.I1)]
         public static extern bool StopStream();
 
+        [DllImport("MISTERCASTLIB.dll", EntryPoint = "SetAudioBufferMs", CallingConvention = CallingConvention.Cdecl)]
+        [return: MarshalAs(UnmanagedType.I1)]
+        public static extern bool SetAudioBufferMs(UInt16 milliseconds);
+
         // Applied at the next StartStream: codec, RGB mode and MTU ride CMD_INIT
         // and cannot be changed on a live session.
         [DllImport("MISTERCASTLIB.dll", EntryPoint = "SetStreamOptions", CallingConvention = CallingConvention.Cdecl)]
