@@ -1,21 +1,36 @@
 #pragma once
 
+#include <mmreg.h>
+#include <ks.h>
+#include <ksmedia.h>
+#include <functiondiscoverykeys_devpkey.h>
+#include "AudioTimeline.h"
+
+AudioTimeline audioTimeline;
+ReceiverAudioClock receiverAudioClock;
+bool audioTimelineActive = false;
+uint64_t audioModeRevision = 0;
+uint32_t audioReconnectEpoch = 0, audioLastDisplayFrame = 0;
+
+int64_t AudioNow100ns()
+{
+    LARGE_INTEGER ticks, frequency;
+    QueryPerformanceCounter(&ticks);
+    QueryPerformanceFrequency(&frequency);
+    return (ticks.QuadPart / frequency.QuadPart) * 10000000 +
+        (ticks.QuadPart % frequency.QuadPart) * 10000000 / frequency.QuadPart;
+}
+
 // REFERENCE_TIME time units per second and per millisecond
 #define REFTIMES_PER_SEC  10000000
 #define REFTIMES_PER_MILLISEC  10000
 
-// Buffers
-//
-// CmdAudio takes its byte count in a uint16, so one drain must stay well under
-// 65535: a larger backlog truncates, and an exact multiple of 65536 puts an
-// empty CMD_AUDIO on the wire that the core rejects with UDP_ERROR. That is not
-// hypothetical - the WASAPI loopback buffer below is a full second deep, so any
-// stall (notably the gap between the stream starting and the first video frame)
-// builds one. 16 KB is ~85 ms at 48 kHz stereo; steady state is ~3.2 KB/frame.
+// Bound each send below CMD_AUDIO's uint16 byte limit, including after stalls.
 #define AUDIO_MAX_BYTES   16384
 #define AUDIO_MAX_SAMPLES (AUDIO_MAX_BYTES / 2)  // int16 samples, 4096 stereo frames
 
 unsigned int AudioWritePos = 0;                  // in int16 samples, always even
+unsigned int AudioShedFrames = 0;                // stereo frames dropped to stay under the cap
 std::atomic_int audioSampleRate;
 int16_t* audioBuffer = nullptr;                  // points at the client's registered audio buffer
 
@@ -29,6 +44,122 @@ IAudioClient *pAudioClient = NULL;
 IAudioCaptureClient *pCaptureClient = NULL;
 WAVEFORMATEX *pwfx = NULL;
 bool audioFormatUsable = false;
+DWORD audioComThread = 0;
+
+struct AudioCounters
+{
+    uint64_t packets = 0, received = 0, converted = 0, discarded = 0, offered = 0, gated = 0;
+    uint64_t silent = 0, discontinuities = 0, timestampErrors = 0;
+    uint64_t positionGaps = 0, positionRegressions = 0, qpcRegressions = 0;
+    uint64_t firstPosition = 0, lastPosition = 0, firstQpc = 0, lastQpc = 0;
+    uint64_t validPositions = 0;
+} audioCounters;
+uint64_t audioExpectedPosition = 0, audioPreviousQpc = 0;
+bool audioPositionValid = false;
+auto audioReportStart = std::chrono::steady_clock::now();
+
+void ReportAudioCapture(bool final = false)
+{
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - audioReportStart).count();
+    if (!final && seconds < 2.0)
+        return;
+    if (diagnosticLogLevel.load() >= 1)
+    {
+        const auto& a = audioCounters;
+        const auto count = [](uint64_t value) { return static_cast<unsigned long long>(value); };
+        char line[768];
+        snprintf(line, sizeof(line),
+            "[audio] elapsed=%.3fs packets=%llu received=%llu converted=%llu discarded=%llu offered=%llu gated=%llu silent=%llu discontinuities=%llu timestampErrors=%llu gapFrames=%llu positionRegressions=%llu qpcRegressions=%llu validPositions=%llu position=%llu..%llu qpc100ns=%llu..%llu final=%d",
+            seconds, count(a.packets), count(a.received), count(a.converted), count(a.discarded), count(a.offered), count(a.gated),
+            count(a.silent), count(a.discontinuities), count(a.timestampErrors), count(a.positionGaps),
+            count(a.positionRegressions), count(a.qpcRegressions), count(a.validPositions),
+            count(a.firstPosition), count(a.lastPosition), count(a.firstQpc), count(a.lastQpc), final);
+        LogMessage(line);
+        const auto& t = audioTimeline.counters;
+        snprintf(line, sizeof(line),
+            "[audio-timeline] queuedFrames=%u insertedSilence=%llu late=%llu rejected=%llu skipped=%llu rebased=%llu correction=%.2f frames rate=%.1fppm sourceError=%.1f frames maxSendGap=%.2fms final=%d",
+            audioTimeline.pending(), count(t.insertedSilence), count(t.late), count(t.rejected),
+            count(t.skipped), count(t.rebased), t.rateCorrectionFrames, audioTimeline.ratePpm(),
+            audioTimeline.sourceErrorFrames(AudioNow100ns()), t.maxSendGap100ns / 10000.0, final);
+        LogMessage(line);
+        const auto& c = receiverAudioClock.counters;
+        snprintf(line, sizeof(line),
+            "[audio-clock] estimatedLead=%lld targetLead=%lld stale=%d staleReports=%llu reanchors=%llu final=%d",
+            static_cast<long long>(audioTimeline.outputFrames() - receiverAudioClock.played()),
+            static_cast<long long>(receiverAudioClock.lead()), receiverAudioClock.stale(),
+            count(c.staleReports), count(c.reanchors), final);
+        LogMessage(line);
+    }
+    audioTimeline.counters = {};
+    receiverAudioClock.counters = {};
+    audioCounters = {};
+    audioReportStart = now;
+}
+
+void RecordAudioPacket(UINT32 frames, DWORD flags, UINT64 position, UINT64 qpc)
+{
+    ++audioCounters.packets;
+    audioCounters.received += frames;
+    if (flags & AUDCLNT_BUFFERFLAGS_SILENT)
+        audioCounters.silent += frames;
+    if (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY)
+        ++audioCounters.discontinuities;
+    if (flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR)
+    {
+        ++audioCounters.timestampErrors;
+        audioPositionValid = false;
+        return;
+    }
+    if (audioPositionValid)
+    {
+        if (position > audioExpectedPosition)
+            audioCounters.positionGaps += position - audioExpectedPosition;
+        else if (position < audioExpectedPosition)
+            ++audioCounters.positionRegressions;
+        if (qpc < audioPreviousQpc)
+            ++audioCounters.qpcRegressions;
+    }
+    if (audioCounters.validPositions++ == 0)
+    {
+        audioCounters.firstPosition = position;
+        audioCounters.firstQpc = qpc;
+    }
+    audioCounters.lastPosition = position;
+    audioCounters.lastQpc = qpc;
+    audioExpectedPosition = position + frames;
+    audioPreviousQpc = qpc;
+    audioPositionValid = true;
+}
+
+std::string AudioDeviceText(const wchar_t* value)
+{
+    if (!value)
+        return "<unavailable>";
+    const int size = WideCharToMultiByte(CP_ACP, 0, value, -1, nullptr, 0, nullptr, nullptr);
+    if (size <= 0)
+        return "<unavailable>";
+    std::string result(size, '\0');
+    WideCharToMultiByte(CP_ACP, 0, value, -1, &result[0], size, nullptr, nullptr);
+    result.resize(size - 1);
+    return result;
+}
+
+void LogAudioEndpoint()
+{
+    LPWSTR id = nullptr;
+    IPropertyStore* properties = nullptr;
+    PROPVARIANT name;
+    PropVariantInit(&name);
+    pDevice->GetId(&id);
+    if (SUCCEEDED(pDevice->OpenPropertyStore(STGM_READ, &properties)))
+        properties->GetValue(PKEY_Device_FriendlyName, &name);
+    LogMessage("[audio] endpoint=" + AudioDeviceText(name.vt == VT_LPWSTR ? name.pwszVal : nullptr) +
+        " id=" + AudioDeviceText(id) + " role=eRender/eConsole initTid=" + std::to_string(GetCurrentThreadId()));
+    PropVariantClear(&name);
+    CoTaskMemFree(id);
+    SAFE_RELEASE(properties);
+}
 
 bool InitAudioCapture()
 {
@@ -36,6 +167,7 @@ bool InitAudioCapture()
 
     hr = CoInitialize(nullptr);
     EXIT_ON_ERROR(hr, "CoInitialize failed");
+    audioComThread = GetCurrentThreadId();
 
     hr = CoCreateInstance(
         __uuidof(MMDeviceEnumerator), NULL,
@@ -45,6 +177,7 @@ bool InitAudioCapture()
 
     hr = pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice);
     EXIT_ON_ERROR(hr, "IMMDeviceEnumerator GetDefaultAudioEndpoint failed");
+    LogAudioEndpoint();
 
     hr = pDevice->Activate(
         __uuidof(IAudioClient), CLSCTX_ALL,
@@ -52,17 +185,30 @@ bool InitAudioCapture()
     EXIT_ON_ERROR(hr, "IMMDevice Activate failed");
 
     hr = pAudioClient->GetMixFormat(&pwfx);
-    audioSampleRate = pwfx->nSamplesPerSec;
     EXIT_ON_ERROR(hr, "IAudioClient GetMixFormat failed");
+    audioSampleRate = pwfx->nSamplesPerSec;
 
-    // The shared-mode mix format is 32-bit float in every shipping configuration
-    // of WASAPI, and the capture path below reads it as such. Refuse rather than
-    // reinterpret if that ever stops being true.
-    audioFormatUsable = (pwfx->wBitsPerSample == 32 && pwfx->nChannels >= 1);
+    bool floatFormat = pwfx->wFormatTag == WAVE_FORMAT_IEEE_FLOAT;
+    std::string extended;
+    if (pwfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+        pwfx->cbSize >= sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX))
+    {
+        const auto* format = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(pwfx);
+        floatFormat = IsEqualGUID(format->SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
+        wchar_t guid[40] = {};
+        StringFromGUID2(format->SubFormat, guid, ARRAYSIZE(guid));
+        extended = " validBits=" + std::to_string(format->Samples.wValidBitsPerSample) +
+            " channelMask=" + std::to_string(format->dwChannelMask) + " subFormat=" + AudioDeviceText(guid);
+    }
+    LogMessage("[audio] format tag=" + std::to_string(pwfx->wFormatTag) +
+        " rate=" + std::to_string(pwfx->nSamplesPerSec) + " channels=" + std::to_string(pwfx->nChannels) +
+        " bits=" + std::to_string(pwfx->wBitsPerSample) + " blockAlign=" + std::to_string(pwfx->nBlockAlign) +
+        " bytesPerSecond=" + std::to_string(pwfx->nAvgBytesPerSec) + " extraBytes=" + std::to_string(pwfx->cbSize) + extended);
+    audioFormatUsable = floatFormat && pwfx->wBitsPerSample == 32 && pwfx->nChannels >= 1 &&
+        pwfx->nBlockAlign == pwfx->nChannels * sizeof(float);
     if (!audioFormatUsable)
     {
-        LogMessage("Windows is mixing at " + std::to_string(pwfx->wBitsPerSample) +
-            " bits per sample, which MiSTerCast cannot convert. Audio is disabled.", true);
+        LogMessage("The Windows mix format is not packed 32-bit float. Audio is disabled.", true);
     }
     else if (pwfx->nChannels > 2)
     {
@@ -81,6 +227,8 @@ bool InitAudioCapture()
 
     hr = pAudioClient->GetBufferSize(&bufferFrameCount);
     EXIT_ON_ERROR(hr, "IAudioClient  GetBufferSize failed");
+    LogMessage("[audio] capacityFrames=" + std::to_string(bufferFrameCount) +
+        " requested100ns=" + std::to_string(hnsRequestedDuration));
 
     hr = pAudioClient->GetService(__uuidof(IAudioCaptureClient), (void**)&pCaptureClient);
     EXIT_ON_ERROR(hr, "IAudioClient GetService failed");
@@ -88,18 +236,39 @@ bool InitAudioCapture()
     return true;
 }
 
-void CleanupAudioCatpure()
+void CleanupAudioCapture()
 {
     CoTaskMemFree(pwfx);
+    pwfx = nullptr;
+    SAFE_RELEASE(pCaptureClient)
+    SAFE_RELEASE(pAudioClient)
     SAFE_RELEASE(pEnumerator)
     SAFE_RELEASE(pDevice)
-    SAFE_RELEASE(pAudioClient)
-    SAFE_RELEASE(pCaptureClient)
+    audioBuffer = nullptr;
+    audioFormatUsable = false;
+    if (audioComThread == GetCurrentThreadId())
+        CoUninitialize();
+    else if (audioComThread)
+        LogMessage("Audio COM cleanup called on a different thread from Initialize.", true);
+    audioComThread = 0;
 }
 
 bool StartAudioCapture()
 {
-    HRESULT hr = pAudioClient->Start();
+    audioTimelineActive = false;
+    audioModeRevision = 0;
+    audioReconnectEpoch = audioLastDisplayFrame = 0;
+    audioTimeline.reset(0, 0, AudioNow100ns());
+    AudioWritePos = AudioShedFrames = 0;
+    audioCounters = {};
+    audioPositionValid = false;
+    audioReportStart = std::chrono::steady_clock::now();
+    if (!pAudioClient || !audioFormatUsable)
+        return false;
+    HRESULT hr = pAudioClient->Reset();
+    EXIT_ON_ERROR(hr, "IAudioClient Reset failed");
+    hr = pAudioClient->Start();
+    LogMessage("[audio] Start hr=" + std::to_string(hr));
     EXIT_ON_ERROR(hr, "IAudioClient Start failed");
 
     return true;
@@ -109,27 +278,29 @@ bool StopAudioCapture()
 {
 
     HRESULT hr = pAudioClient->Stop();
+    LogMessage("[audio] Stop hr=" + std::to_string(hr));
     EXIT_ON_ERROR(hr, "IAudioCaptureClient Stop failed");
 
      return true;
 }
 
-// Float sample to signed 16-bit LE. The clamp matters: mixers with DC filters
-// and volume scaling overshoot +-1.0, and an unclamped sample wraps into an
-// audible click rather than clipping.
-inline int16_t AudioSampleToS16(float sample)
-{
-    if (sample > 1.0f)
-        sample = 1.0f;
-    else if (sample < -1.0f)
-        sample = -1.0f;
-
-    return (int16_t)(sample * 32767.0f);
-}
-
-bool TickAudioCapture()
+bool TickAudioCapture(bool accepting, unsigned bufferMs, uint32_t displayFrame,
+    double fieldMs, uint64_t modeRevision, uint32_t reconnectEpoch)
 {
     AudioWritePos = 0;
+    const bool resetClock = !audioTimelineActive || modeRevision != audioModeRevision ||
+        reconnectEpoch != audioReconnectEpoch || displayFrame < audioLastDisplayFrame;
+    if (accepting && resetClock)
+    {
+        const int64_t now = AudioNow100ns();
+        audioTimeline.reset(audioSampleRate.load(), bufferMs, now);
+        receiverAudioClock.reset(audioSampleRate.load(), bufferMs, fieldMs, displayFrame, now);
+        audioModeRevision = modeRevision;
+        audioReconnectEpoch = reconnectEpoch;
+        LogMessage("[audio-timeline] started bufferMs=" + std::to_string(bufferMs));
+    }
+    audioTimelineActive = accepting;
+    audioLastDisplayFrame = displayFrame;
     UINT32 packetLength = 0;
     HRESULT hr = pCaptureClient->GetNextPacketSize(&packetLength);
     EXIT_ON_ERROR(hr, "IAudioCaptureClient GetNextPacketSize failed");
@@ -141,61 +312,28 @@ bool TickAudioCapture()
         // Get the available data in the shared buffer.
         BYTE *pData;
         DWORD flags;
+        UINT64 devicePosition = 0, qpcPosition = 0;
         hr = pCaptureClient->GetBuffer(
             &pData,
             &numFramesAvailable,
-            &flags, NULL, NULL);
+            &flags, &devicePosition, &qpcPosition);
         EXIT_ON_ERROR(hr, "IAudioCaptureClient GetBuffer failed");
-
-        // Keep draining even when there is nowhere to put it, otherwise the
-        // endpoint buffer backs up and every later packet is discontinuous.
-        if (audioBuffer && audioFormatUsable)
+        RecordAudioPacket(numFramesAvailable, flags, devicePosition, qpcPosition);
+        if (accepting && audioBuffer && audioFormatUsable)
         {
-            const bool silence = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
-            const float* pDataFloat = (const float*)pData;
-            const unsigned int capFrames = AUDIO_MAX_SAMPLES / 2;
-
-            // Shed the oldest audio so latency self-corrects after a stall
-            // instead of accumulating. Done in whole stereo frames, and at most
-            // one move per packet - trimming a frame at a time would be
-            // quadratic on the backlog this exists to handle.
-            UINT32 firstFrame = 0;
-            if (numFramesAvailable > capFrames)
-            {
-                // This packet alone overflows; everything older is superseded.
-                firstFrame = numFramesAvailable - capFrames;
-                AudioWritePos = 0;
-            }
-
-            const UINT32 framesToWrite = numFramesAvailable - firstFrame;
-            const unsigned int heldFrames = AudioWritePos / 2;
-            if (heldFrames + framesToWrite > capFrames)
-            {
-                const unsigned int dropFrames = heldFrames + framesToWrite - capFrames;
-                const unsigned int keepSamples = AudioWritePos - dropFrames * 2;
-                memmove(audioBuffer, audioBuffer + dropFrames * 2, keepSamples * sizeof(int16_t));
-                AudioWritePos = keepSamples;
-            }
-
-            for (UINT32 frame = firstFrame; frame < numFramesAvailable; frame++)
-            {
-                if (silence)
-                {
-                    audioBuffer[AudioWritePos] = 0;
-                    audioBuffer[AudioWritePos + 1] = 0;
-                }
-                else
-                {
-                    const float* srcFrame = pDataFloat + (size_t)frame * channels;
-                    const int16_t left = AudioSampleToS16(srcFrame[0]);
-                    const int16_t right = (channels >= 2) ? AudioSampleToS16(srcFrame[1]) : left;
-                    audioBuffer[AudioWritePos] = left;
-                    audioBuffer[AudioWritePos + 1] = right;
-                }
-
-                AudioWritePos += 2;
-            }
+            const auto before = audioTimeline.counters;
+            audioTimeline.push(reinterpret_cast<const float*>(pData), numFramesAvailable, channels,
+                (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0, devicePosition, static_cast<int64_t>(qpcPosition),
+                (flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) == 0,
+                (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0);
+            const uint64_t dropped = audioTimeline.counters.late - before.late +
+                audioTimeline.counters.rejected - before.rejected;
+            audioCounters.discarded += dropped;
+            audioCounters.converted += numFramesAvailable - dropped;
+            AudioShedFrames += static_cast<unsigned>(dropped);
         }
+        else
+            audioCounters.gated += numFramesAvailable;
 
         hr = pCaptureClient->ReleaseBuffer(numFramesAvailable);
         EXIT_ON_ERROR(hr, "IAudioCaptureClient ReleaseBuffer failed");
@@ -204,5 +342,17 @@ bool TickAudioCapture()
         EXIT_ON_ERROR(hr, "IAudioCaptureClient GetNextPacketSize failed");
     }
 
+    if (accepting && audioBuffer)
+    {
+        const int64_t now = AudioNow100ns();
+        int64_t due = receiverAudioClock.due(displayFrame, now);
+        if (due - audioTimeline.outputFrames() > AUDIO_MAX_SAMPLES / 2)
+        {
+            receiverAudioClock.reanchor(displayFrame, now, audioTimeline.outputFrames());
+            audioTimeline.rebaseToNow(now);
+            due = receiverAudioClock.due(displayFrame, now);
+        }
+        AudioWritePos = audioTimeline.render(now, due, audioBuffer, AUDIO_MAX_SAMPLES / 2) * 2;
+    }
     return true;
 }

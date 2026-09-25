@@ -21,6 +21,9 @@ The Microsoft VC++ x64 Redistributable is required: https://aka.ms/vs/17/release
 
 For audio, you will need to enable audio on the Groovy_MiSTer core.
 
+## Requirements
+Windows 10 or newer. Single-window capture needs 1903 or newer; display capture does not.
+
 ## Stream options
 These ride the Groovy connection handshake, so they apply at the next **Start Stream** and are locked while streaming.
 
@@ -49,4 +52,4 @@ Modelines are validated before use. A mode is refused if its blanking does not e
 Find more modeline examples here: https://www.geocities.ws/podernixie/htpc/modes-en.html
 
 ## Building
-Open `FrontEnd/MiSTerCast.sln` and build the `x64` (or `x86`) configuration. There are no external dependencies to fetch — LZ4 and the Groovy client are vendored in `Library/MiSTerCastLib/` (see its `PROVENANCE.md`).
+Open `FrontEnd/MiSTerCast.sln` and build the `x64` (or `x86`) configuration. There are no external dependencies to fetch — LZ4 and the Groovy client are vendored in `Library/MiSTerCastLib/`.

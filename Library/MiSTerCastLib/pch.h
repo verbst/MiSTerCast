@@ -25,6 +25,8 @@
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <mutex>
+#include <condition_variable>
 #include <string.h>
 
 #include <MMDeviceAPI.h>
@@ -46,5 +48,13 @@
 
 #include <d3d11.h>
 #include <dxgi1_2.h>
+#include <d2d1_1.h>
+#include <windows.graphics.capture.interop.h>
+#include <windows.graphics.directx.direct3d11.interop.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Graphics.h>
+#include <winrt/Windows.Graphics.Capture.h>
+#include <winrt/Windows.Graphics.DirectX.h>
+#include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
 
 #endif //PCH_H

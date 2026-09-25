@@ -37,6 +37,7 @@ enum CropMode : int
     X5,
     Full43,
     Full54,
+    FullSource,
 };
 
 enum Rotation : int
@@ -85,8 +86,7 @@ enum ModelineValidation : int
     ModelineOverCrtEnvelope = 3   // beyond what a fixed-frequency CRT should be asked to sync
 };
 
-// Everything here rides CMD_INIT and cannot change mid-session, so these are
-// applied at the next StartStream rather than live.
+// Applied at the next StartStream rather than live.
 struct StreamOptions {
     UINT8  codec;
     UINT8  nlcPack;             // ignored unless codec == CodecNLC
@@ -96,6 +96,7 @@ struct StreamOptions {
     bool   autoReconnect;
     UINT8  verbose;             // GroovyMister log verbosity, 0-2
     bool   allowOversizeModes;  // bypass the CRT envelope check (not the byte budget)
+    UINT16 audioBufferMs = 40;
 };
 
 struct SourceOptions {
@@ -111,6 +112,7 @@ struct SourceOptions {
     INT16 xoffset;
     INT16 yoffset;
     UINT8 rotation;
+    UINT_PTR windowHandle;  // 0 = capture the display in `display`; otherwise capture this window
 };
 
 typedef void(__stdcall *log_function)(const char* message, bool error);
@@ -124,6 +126,8 @@ MISTERCASTLIB_API bool Shutdown();
 MISTERCASTLIB_API bool StartStream(const char* targetIp);
 
 MISTERCASTLIB_API bool StopStream();
+
+MISTERCASTLIB_API bool SetAudioBufferMs(UINT16 milliseconds);
 
 // Applies at the next StartStream. Codec, RGB mode and MTU ride CMD_INIT and
 // cannot be changed on a live session.
@@ -178,3 +182,6 @@ MISTERCASTLIB_API bool SetSource(
     INT16 xoffset,
     INT16 yoffset,
     UINT8 rotation);
+
+// 0 returns to capturing the display set by SetSource. Needs Win10 1903+.
+MISTERCASTLIB_API bool SetCaptureWindow(UINT_PTR windowHandle);

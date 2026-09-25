@@ -7,8 +7,10 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using Microsoft.Win32;
 using System.Globalization;
 using System.Net;
@@ -44,6 +46,25 @@ namespace MiSTerCast
         public byte rotation;
     }
 
+    sealed class WindowCaptureSource
+    {
+        public IntPtr Handle { get; set; }
+        public string Title { get; set; }
+        public string ProcessName { get; set; }
+
+        public string Key
+        {
+            get { return ProcessName + "\t" + Title; }
+        }
+
+        public override string ToString()
+        {
+            return String.IsNullOrWhiteSpace(ProcessName)
+                ? Title
+                : Title + " — " + ProcessName;
+        }
+    }
+
     public partial class MainWindow : Window
     {
         private bool isInitialized = false;
@@ -51,6 +72,45 @@ namespace MiSTerCast
         HelpWindow helpWindow = null;
         const string lastSaveFilename = "lastsave.dat";
         string currentSaveFilename = null;
+        private bool isRefreshingWindowSources;
+
+        private delegate bool EnumWindowsCallback(IntPtr windowHandle, IntPtr parameter);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool EnumWindows(EnumWindowsCallback callback, IntPtr parameter);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool IsWindowVisible(IntPtr windowHandle);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern int GetWindowText(IntPtr windowHandle, StringBuilder text, int maximumCount);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern int GetWindowTextLength(IntPtr windowHandle);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern uint GetWindowThreadProcessId(IntPtr windowHandle, out uint processId);
+
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongW", SetLastError = true)]
+        private static extern int GetWindowLong(IntPtr windowHandle, int index);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetWindow(IntPtr windowHandle, uint command);
+
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmGetWindowAttribute(
+            IntPtr windowHandle,
+            int attribute,
+            out int value,
+            int valueSize);
+
+        private const int ExtendedWindowStyleIndex = -20;
+        private const int ToolWindowStyle = 0x00000080;
+        private const int AppWindowStyle = 0x00040000;
+        private const uint GetOwnerWindow = 4;
+        private const int DwmWindowAttributeCloaked = 14;
 
         private void InitializeMiSTerCast()
         {
@@ -70,9 +130,38 @@ namespace MiSTerCast
         public MainWindow()
         {
             InitializeComponent();
+            RefreshWindowSources(null, true);
             ReadModelinesFile();
             PopulateModelineDropdown();
             InitializeMiSTerCast();
+            LogBuildIdentity();
+        }
+
+        private void LogBuildIdentity()
+        {
+            try
+            {
+                using (Process process = Process.GetCurrentProcess())
+                {
+                    Log("[process] pid=" + process.Id + " started=" + process.StartTime.ToUniversalTime().ToString("o"));
+                    foreach (ProcessModule module in process.Modules)
+                    {
+                        if (!String.Equals(module.ModuleName, "MiSTerCast.exe", StringComparison.OrdinalIgnoreCase) &&
+                            !String.Equals(module.ModuleName, "MISTERCASTLIB.dll", StringComparison.OrdinalIgnoreCase))
+                            continue;
+                        using (var hash = System.Security.Cryptography.SHA256.Create())
+                        using (var file = File.OpenRead(module.FileName))
+                        {
+                            Log("[build] path=" + module.FileName + " modified=" + File.GetLastWriteTimeUtc(module.FileName).ToString("o") +
+                                " sha256=" + BitConverter.ToString(hash.ComputeHash(file)).Replace("-", ""));
+                        }
+                    }
+                }
+            }
+            catch (Exception error)
+            {
+                Log("Build identity unavailable: " + error.Message, true);
+            }
         }
 
         void MainWindow_Closing(object sender, CancelEventArgs e)
@@ -80,7 +169,16 @@ namespace MiSTerCast
             if (isStreaming)
                 MiSTerCastInterop.StopStream();
             MiSTerCastInterop.Shutdown();
-            helpWindow.Close();
+            if (helpWindow != null)
+                helpWindow.Close();
+            Log("[process] native shutdown returned; application closing.");
+            lock (logFileLock)
+            {
+                if (logFile != null)
+                    logFile.Close();
+                logFile = null;
+                logFileTried = true;
+            }
         }
 
         private void Window_Closed(object sender, EventArgs e)
@@ -154,7 +252,10 @@ namespace MiSTerCast
                 {
                     isStreaming = false;
                     ToggleStreamButton.Content = "Start Stream";
+                    CaptureModeBox.IsEnabled = true;
                     CaptureSourceBox.IsEnabled = true;
+                    WindowSourceBox.IsEnabled = true;
+                    RefreshWindowsButton.IsEnabled = true;
                     EnableAudioCheckBox.IsEnabled = true;
                     ApplyModelineButton.IsEnabled = false;
                     SetStreamControlsEnabled(true);
@@ -167,6 +268,13 @@ namespace MiSTerCast
 
                 if (isInitialized)
                 {
+                    UInt16 audioBufferMs;
+                    if (!TryGetAudioBuffer(out audioBufferMs))
+                    {
+                        Log("Audio buffer must be a whole number from 0 to 200 ms.", true);
+                        return;
+                    }
+                    MiSTerCastInterop.SetAudioBufferMs(audioBufferMs);
                     // The modeline gate is the only thing between a mistyped mode
                     // and the FPGA, so refuse to start rather than blit past the
                     // Groovy client's buffer.
@@ -195,7 +303,10 @@ namespace MiSTerCast
                     {
                         isStreaming = true;
                         ToggleStreamButton.Content = "Stop Stream";
+                        CaptureModeBox.IsEnabled = false;
                         CaptureSourceBox.IsEnabled = false;
+                        WindowSourceBox.IsEnabled = false;
+                        RefreshWindowsButton.IsEnabled = false;
                         EnableAudioCheckBox.IsEnabled = false;
                         // Codec, RGB mode and MTU ride CMD_INIT; they cannot be
                         // changed until the session is torn down and rebuilt.
@@ -239,6 +350,7 @@ namespace MiSTerCast
 
         private void SetStreamControlsEnabled(bool enabled)
         {
+            AudioBufferTextBox.IsEnabled = enabled;
             bool isNlc = CodecComboBox.SelectedIndex == (int)MiSTerCastInterop.Codec.NLC;
 
             CodecComboBox.IsEnabled = enabled;
@@ -261,14 +373,34 @@ namespace MiSTerCast
             OnStreamOptionsChanged();
         }
 
+        private bool TryGetAudioBuffer(out UInt16 milliseconds)
+        {
+            return UInt16.TryParse(AudioBufferTextBox.Text, out milliseconds) && milliseconds <= 200;
+        }
+
+        private void AudioBuffer_TextChanged(object sender, TextChangedEventArgs e)
+        {
+            if (!isInitialized) return;
+            UInt16 milliseconds;
+            bool valid = TryGetAudioBuffer(out milliseconds);
+            AudioBufferTextBox.Background = valid ? SystemColors.WindowBrush : Brushes.MistyRose;
+            if (valid) MiSTerCastInterop.SetAudioBufferMs(milliseconds);
+        }
+
         #endregion Stream Options
 
         #region Settings
 
-        const int SettingsVersion = 2;
+        const int SettingsVersion = 4;
 
         private void SaveSettingsButton_Click(object sender, RoutedEventArgs e)
         {
+            UInt16 audioBufferMs;
+            if (!TryGetAudioBuffer(out audioBufferMs))
+            {
+                Log("Audio buffer must be a whole number from 0 to 200 ms.", true);
+                return;
+            }
             try
             {
                 SaveFileDialog saveFileDialog = new SaveFileDialog();
@@ -323,6 +455,14 @@ namespace MiSTerCast
                                 sw.WriteLine(LogLevelComboBox.SelectedIndex);
                                 sw.WriteLine(AllowOversizeCheckBox.IsChecked.Value ? 1 : 0);
 
+                                // Version 3 additions, appended so version 1-2 files still load.
+                                sw.WriteLine(CaptureModeBox.SelectedIndex);
+                                WindowCaptureSource selectedWindow = WindowSourceBox.SelectedItem as WindowCaptureSource;
+                                sw.WriteLine(selectedWindow == null
+                                    ? String.Empty
+                                    : selectedWindow.Key.Replace("\r", " ").Replace("\n", " "));
+
+                                sw.WriteLine(audioBufferMs);
                                 Log("Settings saved.");
                             }
                         }
@@ -425,8 +565,33 @@ namespace MiSTerCast
                 Log("Loaded a version 1 settings file: codec kept at LZ4, as that is what it was saved with.");
             }
 
+            if (settingsVersion >= 3)
+            {
+                int captureMode = int.Parse(sr.ReadLine());
+                string savedWindowKey = sr.ReadLine();
+                CaptureModeBox.SelectedIndex = Math.Max(0, Math.Min(captureMode, CaptureModeBox.Items.Count - 1));
+                if (CaptureModeBox.SelectedIndex == 1)
+                {
+                    RefreshWindowSources(savedWindowKey, false);
+                    if (WindowSourceBox.SelectedItem == null)
+                        Log("The saved capture window is not currently available. Restore it and refresh the window list.", true);
+                }
+            }
+            else
+            {
+                CaptureModeBox.SelectedIndex = 0;
+            }
+
             OnStreamOptionsChanged();
 
+            UInt16 bufferMs = 40;
+            if (settingsVersion >= 4 && (!UInt16.TryParse(sr.ReadLine(), out bufferMs) || bufferMs > 200))
+            {
+                bufferMs = 40;
+                Log("Invalid saved audio buffer; using 40 ms.", true);
+            }
+            AudioBufferTextBox.Text = bufferMs.ToString(CultureInfo.InvariantCulture);
+            MiSTerCastInterop.SetAudioBufferMs(bufferMs);
             Log("Settings loaded.");
         }
 
@@ -481,11 +646,69 @@ namespace MiSTerCast
         #region Logs
 
         private MiSTerCastInterop.LogDelegate LogDelegate;
+        private StreamWriter logFile;
+        private bool logFileTried = false;
+        private readonly object logFileLock = new object();
+
+        // Separate launches must not overwrite each other's diagnostic evidence.
+        private StreamWriter OpenLogFile(out string path)
+        {
+            string filename;
+            using (Process process = Process.GetCurrentProcess())
+                filename = "MiSTerCast-" + process.StartTime.ToUniversalTime().ToString("yyyyMMdd-HHmmss-fff") + "-" + process.Id + ".log";
+            string[] candidates =
+            {
+                Path.Combine(AppDomain.CurrentDomain.BaseDirectory, filename),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MiSTerCast", filename),
+            };
+            foreach (string candidate in candidates)
+            {
+                try
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(candidate));
+                    StreamWriter writer = new StreamWriter(candidate, false) { AutoFlush = true };
+                    path = candidate;
+                    return writer;
+                }
+                catch (Exception)
+                {
+                }
+            }
+            path = null;
+            return null;
+        }
 
         private void Log(string message, bool error = false)
         {
+            // Called from the library's capture and stream threads as well as the UI thread.
+            // Nothing in here may throw: an exception on those threads takes the process down.
+            string opened = null;
+            lock (logFileLock)
+            {
+                if (!logFileTried)
+                {
+                    logFileTried = true;
+                    logFile = OpenLogFile(out opened);
+                }
+                if (logFile != null)
+                {
+                    try
+                    {
+                        if (opened != null)
+                            logFile.WriteLine("Log file: " + opened);
+                        logFile.WriteLine(DateTime.Now.ToString("HH:mm:ss.fff") + (error ? " ! " : "   ") + message);
+                    }
+                    catch (Exception)
+                    {
+                        logFile = null; // disk full or device gone; stop trying
+                    }
+                }
+            }
+
             this.Dispatcher.InvokeAsync(() =>
             {
+                if (opened != null)
+                    LogPanel.Children.Add(new TextBlock() { Text = "Log file: " + opened });
                 TextBlock logText = new TextBlock() { Text = message };
                 if (error)
                     logText.Background = Brushes.Pink;
@@ -537,6 +760,17 @@ namespace MiSTerCast
             PreviewImage.Visibility = currentSourceOptions.preview ? Visibility.Visible : Visibility.Hidden;
             PreviewDisabledLabel.Visibility = currentSourceOptions.preview ? Visibility.Hidden : Visibility.Visible;
 
+            IntPtr captureWindowHandle = IntPtr.Zero;
+            if (CaptureModeBox.SelectedIndex == 1)
+            {
+                WindowCaptureSource selectedWindow = WindowSourceBox.SelectedItem as WindowCaptureSource;
+                if (selectedWindow == null)
+                    return;
+                captureWindowHandle = selectedWindow.Handle;
+            }
+            if (!MiSTerCastInterop.SetCaptureWindow(captureWindowHandle))
+                return;
+
             if (currentSourceOptions.width > 0 && currentSourceOptions.height > 0)
             {
                 MiSTerCastInterop.SetSource(
@@ -551,6 +785,121 @@ namespace MiSTerCast
                     currentSourceOptions.yoffset,
                     currentSourceOptions.rotation);
             }
+        }
+
+        private List<WindowCaptureSource> EnumerateCaptureWindows()
+        {
+            List<WindowCaptureSource> windows = new List<WindowCaptureSource>();
+            uint ownProcessId = (uint)Process.GetCurrentProcess().Id;
+            EnumWindows((windowHandle, parameter) =>
+            {
+                if (!IsWindowVisible(windowHandle))
+                    return true;
+
+                int titleLength = GetWindowTextLength(windowHandle);
+                if (titleLength <= 0)
+                    return true;
+
+                uint processId;
+                GetWindowThreadProcessId(windowHandle, out processId);
+                if (processId == 0 || processId == ownProcessId)
+                    return true;
+
+                int extendedStyle = GetWindowLong(windowHandle, ExtendedWindowStyleIndex);
+                bool explicitAppWindow = (extendedStyle & AppWindowStyle) != 0;
+                if ((extendedStyle & ToolWindowStyle) != 0 && !explicitAppWindow)
+                    return true;
+                if (GetWindow(windowHandle, GetOwnerWindow) != IntPtr.Zero && !explicitAppWindow)
+                    return true;
+
+                int cloaked;
+                if (DwmGetWindowAttribute(
+                    windowHandle,
+                    DwmWindowAttributeCloaked,
+                    out cloaked,
+                    sizeof(int)) == 0 && cloaked != 0)
+                {
+                    return true;
+                }
+
+                StringBuilder titleBuilder = new StringBuilder(titleLength + 1);
+                if (GetWindowText(windowHandle, titleBuilder, titleBuilder.Capacity) <= 0)
+                    return true;
+
+                string title = titleBuilder.ToString().Trim();
+                if (title.Length == 0)
+                    return true;
+
+                string processName = String.Empty;
+                try
+                {
+                    processName = Process.GetProcessById((int)processId).ProcessName;
+                }
+                catch
+                {
+                }
+
+                windows.Add(new WindowCaptureSource
+                {
+                    Handle = windowHandle,
+                    Title = title,
+                    ProcessName = processName
+                });
+                return true;
+            }, IntPtr.Zero);
+
+            return windows
+                .OrderBy(window => window.Title, StringComparer.CurrentCultureIgnoreCase)
+                .ThenBy(window => window.ProcessName, StringComparer.CurrentCultureIgnoreCase)
+                .ToList();
+        }
+
+        private void RefreshWindowSources(string preferredKey, bool selectFirst)
+        {
+            WindowCaptureSource previousSelection = WindowSourceBox.SelectedItem as WindowCaptureSource;
+            IntPtr previousHandle = previousSelection == null ? IntPtr.Zero : previousSelection.Handle;
+            string selectionKey = preferredKey ?? (previousSelection == null ? null : previousSelection.Key);
+            List<WindowCaptureSource> windows = EnumerateCaptureWindows();
+
+            WindowCaptureSource selected = windows.FirstOrDefault(window => window.Handle == previousHandle);
+            if (selected == null && !String.IsNullOrEmpty(selectionKey))
+                selected = windows.FirstOrDefault(window => window.Key == selectionKey);
+            if (selected == null && selectFirst)
+                selected = windows.FirstOrDefault();
+
+            isRefreshingWindowSources = true;
+            WindowSourceBox.ItemsSource = windows;
+            WindowSourceBox.SelectedItem = selected;
+            isRefreshingWindowSources = false;
+
+            if (CaptureModeBox.SelectedIndex == 1 && isInitialized)
+                OnCaptureSourceChanged();
+        }
+
+        private void CaptureMode_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (WindowSourcePanel == null || CaptureSourceBox == null)
+                return;
+
+            bool captureWindow = CaptureModeBox.SelectedIndex == 1;
+            CaptureSourceBox.Visibility = captureWindow ? Visibility.Collapsed : Visibility.Visible;
+            WindowSourcePanel.Visibility = captureWindow ? Visibility.Visible : Visibility.Collapsed;
+            if (captureWindow && WindowSourceBox.Items.Count == 0)
+                RefreshWindowSources(null, true);
+
+            if (isInitialized)
+                OnCaptureSourceChanged();
+        }
+
+        private void WindowSource_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (!isRefreshingWindowSources && isInitialized && CaptureModeBox.SelectedIndex == 1)
+                OnCaptureSourceChanged();
+        }
+
+        private void RefreshWindowsButton_Click(object sender, RoutedEventArgs e)
+        {
+            RefreshWindowSources(null, true);
         }
 
         private void CaptureSource_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -677,7 +1026,7 @@ namespace MiSTerCast
             switch (result)
             {
                 case MiSTerCastInterop.ModelineValidation.Malformed:
-                    message = "Modeline is malformed. The pixel clock must be positive and the blanking must "
+                    message = "Modeline is malformed. Interlaced height must be even, the pixel clock must be finite and positive, and blanking must "
                             + "enclose the active area (hbegin >= hactive, hend >= hbegin, htotal > hend, "
                             + "and the same vertically).";
                     break;
@@ -881,18 +1230,22 @@ namespace MiSTerCast
 
         private MiSTerCastInterop.CaptureImageDelegate CaptureImageDelegate;
         private bool isPreviewEnabled = true;
-        
+        private int previewPending = 0;
+
         public void CaptureImage(int width, int height, IntPtr buffer)
         {
-            if (isPreviewEnabled)
+            // Drop the frame if the UI thread has not shown the last one yet; the dispatcher
+            // queue would otherwise grow without bound when capture outruns the UI.
+            if (!isPreviewEnabled || System.Threading.Interlocked.Exchange(ref previewPending, 1) != 0)
+                return;
+
+            BitmapSource source = CreateBitmapSource(width, height, buffer);
+            source.Freeze();
+            this.Dispatcher.InvokeAsync(() =>
             {
-                BitmapSource source = CreateBitmapSource(width, height, buffer);
-                source.Freeze();
-                this.Dispatcher.InvokeAsync(() =>
-                {
-                    PreviewImage.Source = source;
-                });
-            }
+                PreviewImage.Source = source;
+                System.Threading.Interlocked.Exchange(ref previewPending, 0);
+            });
         }
 
         [DllImport("kernel32.dll", EntryPoint = "CopyMemory", SetLastError = false)]
